@@ -55,7 +55,7 @@ function buildRegularItem(item) {
       if (mod.group) o += "<groupMame>" + X(mod.group) + "</groupMame>";
       o += NT + X(mod.name || mod) + NTC;
       o += "<quantity>1</quantity>";
-      o += "<price>" + parseFloat(mod.price || 0).toFixed(2) + "</price>";
+     o += "<price>0.00</price>";
       o += "</Requirement>";
     }
     o += "</Requirements>";
