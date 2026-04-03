@@ -1316,21 +1316,64 @@ var TOPPING_ALIASES = {
 
 // Universal modifier aliases — covers all modifier types
 var MODIFIER_ALIASES = {
-  // Sub fixins
+  // Sub fixins — common speech variants
   "tomato": "tomatoes", "onion": "onions", "hot pepper": "hot_peppers",
   "hot_pepper": "hot_peppers", "hots": "hot_peppers", "hot": "hot_peppers",
   "raw_onion": "raw_onions", "grilled_onion": "grilled_onions",
   "pickle": "pickles", "salt_pepper": "salt_n_pepper", "salt pepper": "salt_n_pepper",
-  "salt and pepper": "salt_n_pepper", "no hots": "everything_no_hots",
-  "everything no hots": "everything_no_hots",
+  "salt and pepper": "salt_n_pepper", "s_p": "salt_n_pepper", "s_and_p": "salt_n_pepper",
+  "no hots": "everything_no_hots", "everything no hots": "everything_no_hots",
+  "no hot peppers": "everything_no_hots", "no_hot_peppers": "everything_no_hots",
+  "mayonnaise": "mayo", "mayonaise": "mayo", "mayonese": "mayo", "may": "mayo",
+  "ketchup": "ketchup", "catsup": "ketchup",
+  "lettice": "lettuce", "letuce": "lettuce",
+  "mustard": "mustard",
+  "extra_meat": "extra_meat", "extra meat": "extra_meat", "double meat": "extra_meat",
+  "extra_cheese": "extra_cheese", "extra cheese": "extra_cheese",
+  "fried_onions": "fried_onions", "fried onion": "fried_onions", "fried_onion": "fried_onions",
+  "grilled_onions": "grilled_onions", "grilled onion": "grilled_onions",
+  "raw_onions": "raw_onions", "raw onion": "raw_onions",
+  "banana_pepper": "banana_peppers", "banana pepper": "banana_peppers", "banana": "banana_peppers",
+  "sweet_pepper": "sweet_peppers", "sweet pepper": "sweet_peppers",
+  "green_pepper": "green_peppers", "green pepper": "green_peppers",
+  "jalapeño": "jalapeno", "jalapeños": "jalapeno", "jalapeno": "jalapeno",
+  "black_olive": "black_olives", "black olive": "black_olives", "olive": "black_olives", "olives": "black_olives",
+  "mushroom": "mushrooms", "shroom": "mushrooms", "shrooms": "mushrooms",
+  "pepperoni": "pepperoni", "peperoni": "pepperoni", "pepperonie": "pepperoni",
+  "sausage": "sausage",
   // Cheese
   "feta": "feta_cheese", "no cheese": "no_cheese", "extra cheese": "extra_cheese",
   "provolone cheese": "provolone", "american cheese": "american", "mozz": "mozzarella",
+  "mozzarela": "mozzarella", "mozzerella": "mozzarella", "mozerella": "mozzarella",
+  "prov": "provolone", "provo": "provolone",
   // Wing flavors
   "general tso": "general_tso_s", "general tsos": "general_tso_s",
   "no sauce": "no_flavor", "plain": "no_flavor", "no flavor": "no_flavor",
+  "lemon_pepper": "lemon_pepper", "lemon pepper": "lemon_pepper",
+  "honey_bbq": "honey_bbq", "honey barbecue": "honey_bbq", "honey barbeque": "honey_bbq",
+  "honey_lemon_pepper": "honey_lemon_pepper", "honey lemon pepper": "honey_lemon_pepper",
+  "honey_old_bay": "honey_old_bay", "honey old bay": "honey_old_bay",
+  "old_bay": "old_bay", "old bay": "old_bay",
+  "honey_mustard": "honey_mustard", "honey mustard": "honey_mustard",
+  "honey_garlic": "honey_garlic", "honey garlic": "honey_garlic",
+  "garlic_parmesan": "garlic_parmesan", "garlic parmesan": "garlic_parmesan", "garlic parm": "garlic_parmesan",
+  "mango_habanero": "mango_habanero", "mango habanero": "mango_habanero", "mango": "mango_habanero",
+  "caribbean_jerk": "caribbean_jerk", "caribbean jerk": "caribbean_jerk",
+  "jamaican_jerk": "jamaican_jerk", "jamaican jerk": "jamaican_jerk", "jerk": "jamaican_jerk",
+  "maryland_style": "maryland_style", "maryland style": "maryland_style", "maryland": "maryland_style",
+  "thai_chili": "thai_chili", "thai chili": "thai_chili", "thai": "thai_chili",
+  "toxic_waste": "toxic_waste", "toxic waste": "toxic_waste", "toxic": "toxic_waste",
+  "southern_style": "southern_style", "southern style": "southern_style", "southern": "southern_style",
+  "spicy_bbq": "spicy_bbq", "spicy bbq": "spicy_bbq", "spicy barbecue": "spicy_bbq",
+  "spicy_honey_bbq": "spicy_honey_bbq", "spicy honey bbq": "spicy_honey_bbq",
+  "extra_hot": "extra_hot", "extra hot": "extra_hot",
+  "roasted_garlic": "roasted_garlic", "roasted garlic": "roasted_garlic",
+  "bourbon": "bourbon",
   // Wing dressings
   "bleu cheese": "blue_cheese", "bleu_cheese": "blue_cheese",
+  "ranch dressing": "ranch", "blue cheese dressing": "blue_cheese",
+  "extra_dressing": "extra_dressing", "extra dressing": "extra_dressing",
+  "hot_sauce": "hot_sauce", "hot sauce": "hot_sauce",
   // Soda
   "diet coke": "diet_coke", "diet pepsi": "diet_pepsi", "cherry coke": "cherry_coke",
   "cherry pepsi": "cherry_pepsi", "coke zero": "coke_zero", "mountain dew": "mountain_dew",
@@ -1341,12 +1384,48 @@ var MODIFIER_ALIASES = {
   "crush grape": "crush_grape", "fruit punch": "fruit_punch",
   "half and half": "half_and_half", "half n half": "half_and_half",
   "starry": "starry_lemon_lime", "starry lemon lime": "starry_lemon_lime",
+  "mt dew": "mountain_dew", "mt. dew": "mountain_dew", "dew": "mountain_dew",
   // Salad dressing
-  "creamy italian": "creamy_italian", "thousand island": "thousand_island",
+  "creamy italian": "creamy_italian", "italian dressing": "creamy_italian", "italian": "creamy_italian",
+  "thousand island": "thousand_island", "thousand": "thousand_island",
   "balsamic vinaigrette": "balsamic_vinaigrette", "balsamic": "balsamic_vinaigrette",
+  "caesar dressing": "caesar",
+  "french dressing": "french",
   // Tender sauce
-  "honey mustard": "honey_mustard", "blue cheese": "blue_cheese",
-  "honey bbq": "honey_bbq", "honey barbeque": "honey_bbq"
+  "blue cheese": "blue_cheese",
+  // Gyro meat
+  "chicken gyro": "chicken", "lamb gyro": "lamb",
+  // Sandwich fixins
+  "fried onion": "fried_onions", "fried_onion": "fried_onions",
+  "banana_pepper": "banana_peppers",
+  "sweet_pepper": "sweet_peppers",
+  "green_pepper": "green_peppers",
+  "black_olive": "black_olives",
+  "mushroom": "mushrooms",
+  "salt_n_pepper": "salt_n_pepper", "salt n pepper": "salt_n_pepper",
+  // Wrap/Gyro fixins
+  "tzatziki": "tzatziki_sauce", "tzatziki sauce": "tzatziki_sauce", "tzatziki_sauce": "tzatziki_sauce",
+  "feta_cheese": "feta_cheese", "feta cheese": "feta_cheese",
+  // Underscore versions (normTopping converts spaces to underscores)
+  "salt_and_pepper": "salt_n_pepper", "double_meat": "extra_meat",
+  "provolone_cheese": "provolone", "american_cheese": "american",
+  "general_tsos": "general_tso_s", "no_sauce": "no_flavor",
+  "honey_barbecue": "honey_bbq", "honey_barbeque": "honey_bbq",
+  "spicy_barbecue": "spicy_bbq",
+  "ranch_dressing": "ranch", "blue_cheese_dressing": "blue_cheese",
+  "mt_dew": "mountain_dew", "half_n_half": "half_and_half",
+  "italian_dressing": "creamy_italian", "caesar_dressing": "caesar",
+  "french_dressing": "french", "chicken_gyro": "chicken", "lamb_gyro": "lamb",
+  "grilled_onion": "grilled_onions", "raw_onion": "raw_onions",
+  "garlic_parm": "garlic_parmesan", "no_hot_peppers": "everything_no_hots",
+  "tartar": "tartar_sauce", "tartar_sauce": "tartar_sauce", "tarter": "tartar_sauce",
+  "tarter_sauce": "tartar_sauce", "tar_tar": "tartar_sauce",
+  "oil_and_vinegar": "oil_and_vinegar", "oil_vinegar": "oil_and_vinegar",
+  "oil and vinegar": "oil_and_vinegar", "oil vinegar": "oil_and_vinegar",
+  "banana_peppers": "banana_peppers", "banana_pepper": "banana_peppers",
+  "green_peppers": "green_peppers", "green_pepper": "green_peppers",
+  "black_olives": "black_olives", "black_olive": "black_olives",
+  "olive": "black_olives", "olives": "black_olives"
 };
 
 // Universal fuzzy resolve for key-based lookups (SUB_FIXINS_IDS, CHEESE_IDS, etc.)
@@ -1502,7 +1581,7 @@ var SUBS_DB = [
 ];
 
 // Sub fixins modifier IDs
-var SUB_FIXINS_IDS = {everything:463,lettuce:464,tomatoes:465,mayo:466,mustard:467,ketchup:468,onions:469,hot_peppers:470,raw_onions:746,grilled_onions:747,everything_no_hots:1302,pickles:1304,salt_n_pepper:1305,extra_meat:471,bacon:472,extra_cheese:473,shrimp:748,ham:744,turkey:745};
+var SUB_FIXINS_IDS = {everything:463,lettuce:464,tomatoes:465,mayo:466,mustard:467,ketchup:468,onions:469,hot_peppers:470,raw_onions:746,grilled_onions:747,fried_onions:695,everything_no_hots:1302,pickles:1304,salt_n_pepper:1305,extra_meat:471,bacon:472,extra_cheese:473,shrimp:748,ham:744,turkey:745,banana_peppers:1306,green_peppers:1307,black_olives:1308,mushrooms:1309,oil_and_vinegar:1310,tartar_sauce:1311};
 var SUB_FIXINS_PRICES = {extra_meat:1.00,bacon:1.00,extra_cheese:1.00,shrimp:1.00};
 var CHEESE_IDS = {american:488,provolone:489,mozzarella:492,feta_cheese:493,feta:493,no_cheese:491,extra_cheese:490};
 var CHEESE_PRICES = {extra_cheese:1.00};
@@ -1527,8 +1606,8 @@ var COMBO_DB = {
   "wings special whole": {sizes:{0:{id:839,price:10.49}}, desc:"4 whole wings + fries + can soda", pizzas:0},
   "chicken box whole": {sizes:{0:{id:838,price:20.99}}, desc:"2x 4pc whole wings + 2 cans", pizzas:0},
   "chicken box buffalo": {sizes:{0:{id:847,price:25.99}}, desc:"2x 6pc buffalo wings + 2 cans", pizzas:0},
-  "burger combo": {sizes:{0:{id:793,price:7.99}}, desc:"cheeseburger sandwich + fries + can soda", pizzas:0},
-  "fish combo": {sizes:{0:{id:831,price:8.99}}, desc:"cheese fish sandwich + fries + can soda", pizzas:0},
+  "burger combo": {sizes:{0:{id:793,price:7.99}}, desc:"cheeseburger sandwich + fries + can soda", pizzas:0, includes_fries:true, includes_can:true},
+  "fish combo": {sizes:{0:{id:831,price:8.99}}, desc:"cheese fish sandwich + fries + can soda", pizzas:0, includes_fries:true, includes_can:true},
   "party deal": {sizes:{0:{id:776,price:84.99}}, desc:"4 large cheese pizzas + 48 wings + fries + 2L", pizzas:4, freeToppings:1},
 };
 
@@ -2224,13 +2303,11 @@ app.post("/retell/function/calculate_combo", function (req, res) {
     // ── Burger/Fish combo ──
     if (dealType === "burger combo") {
       components.push({component_name: "Cheese Burger Sandwich", item_id: "713", category: "Sandwiches", modifiers: []});
-      components.push({component_name: "French Fries", item_id: "607", category: "Sides"});
-      if (sodaFlavor) components.push({component_name: "Can Soda", item_id: "728", category: "Beverages", modifiers: [{name:sodaFlavor,group:"Soda Can",price:0}]});
+      // Fries and soda handled by generic sections above
     }
     if (dealType === "fish combo") {
       components.push({component_name: "Cheese Fish Sandwich", item_id: "718", category: "Sandwiches", modifiers: []});
-      components.push({component_name: "French Fries", item_id: "607", category: "Sides"});
-      if (sodaFlavor) components.push({component_name: "Can Soda", item_id: "728", category: "Beverages", modifiers: [{name:sodaFlavor,group:"Soda Can",price:0}]});
+      // Fries and soda handled by generic sections above
     }
 
     var unitPrice = Math.round((basePrice + totalExtra) * 100) / 100;
