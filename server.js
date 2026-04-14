@@ -5,7 +5,7 @@ app.use(express.json({ limit: "50mb" }));
 
 // ═══════════════════════════════════════════════════
 // DATABASE CONNECTION — loads menu into memory at startup
-// Falls back to hardcoded data if database is unavailable.
+// Falls back to hardcoded data if database is unavailable
 // ═══════════════════════════════════════════════════
 var Pool = null;
 var pool = null;
@@ -1516,10 +1516,10 @@ var COMBO_DB = {
   "pizza sub combo": {sizes:{12:{id:784,price:22.99},14:{id:794,price:24.99},16:{id:744,price:26.99}}, desc:"pizza (1 top) + 8\" sub + fries + can soda", pizzas:1, freeToppings:1, includes_fries:true, includes_can:true},
   "combo deal": {sizes:{12:{id:769,price:29.99},14:{id:770,price:33.99}}, desc:"pizza (1 top) + 8\" sub + wings + 2 cans", pizzas:1, freeToppings:1},
   "sub combo": {sizes:{8:{id:772,price:11.99},12:{id:774,price:15.99}}, desc:"sub + fries + can soda", pizzas:0, includes_fries:true, includes_can:true},
-  "2 sub combo": {sizes:{0:{id:773,price:21.99}}, desc:"2 subs + 2 fries + 2 cans", pizzas:0},
-  "two sub combo": {sizes:{0:{id:773,price:21.99}}, desc:"2 subs + 2 fries + 2 cans", pizzas:0},
-  "3 sub combo": {sizes:{0:{id:780,price:31.99}}, desc:"3 subs + 3 fries + 3 cans", pizzas:0},
-  "three sub combo": {sizes:{0:{id:780,price:31.99}}, desc:"3 subs + 3 fries + 3 cans", pizzas:0},
+  "2 sub combo": {sizes:{0:{id:773,price:21.99}}, desc:"2 subs + 2 fries + 2 cans", pizzas:0, includes_fries:true, includes_can:true, sub_count:2},
+  "two sub combo": {sizes:{0:{id:773,price:21.99}}, desc:"2 subs + 2 fries + 2 cans", pizzas:0, includes_fries:true, includes_can:true, sub_count:2},
+  "3 sub combo": {sizes:{0:{id:780,price:31.99}}, desc:"3 subs + 3 fries + 3 cans", pizzas:0, includes_fries:true, includes_can:true, sub_count:3},
+  "three sub combo": {sizes:{0:{id:780,price:31.99}}, desc:"3 subs + 3 fries + 3 cans", pizzas:0, includes_fries:true, includes_can:true, sub_count:3},
   "wings and sub": {sizes:{0:{id:771,price:17.99}}, desc:"8\" sub + 6 buffalo wings + can soda", pizzas:0},
   "wings special buffalo": {sizes:{0:{id:840,price:9.49}}, desc:"6 buffalo wings + fries + can soda", pizzas:0},
   "wings special whole": {sizes:{0:{id:839,price:10.49}}, desc:"4 whole wings + fries + can soda", pizzas:0},
@@ -2056,6 +2056,7 @@ app.post("/retell/function/calculate_combo", function (req, res) {
     var wingDressing = (args.wing_dressing || "").trim();
     var sodaFlavor = (args.soda_flavor || "").trim();
     var sodaFlavor2 = (args.soda_flavor_2 || "").trim();
+    var sodaFlavor3 = (args.soda_flavor_3 || "").trim();
     var twoLiterFlavor = (args.two_liter_flavor || "").trim();
     var friesUpgrade = (args.fries_upgrade || "").toLowerCase().trim();
 
@@ -2149,6 +2150,37 @@ app.post("/retell/function/calculate_combo", function (req, res) {
       components.push(subComp);
     }
 
+    // ── Build additional sub components (for 2/3 sub combos) ──
+    var extraSubs = [
+      {name: data.sub_name_2, fixins: data.sub_fixins_2 || [], cheese: data.sub_cheese_2 || "", special: data.sub_special_instructions_2 || ""},
+      {name: data.sub_name_3, fixins: data.sub_fixins_3 || [], cheese: data.sub_cheese_3 || "", special: data.sub_special_instructions_3 || ""}
+    ];
+    for (var es = 0; es < extraSubs.length; es++) {
+      if (!extraSubs[es].name) continue;
+      var esub = matchSub(extraSubs[es].name);
+      if (!esub) continue;
+      var esMods = [];
+      var esFixins = extraSubs[es].fixins;
+      if (typeof esFixins === "string") { try { esFixins = JSON.parse(esFixins); } catch(e) { esFixins = [esFixins]; } }
+      for (var ef = 0; ef < esFixins.length; ef++) {
+        var efkey = resolveModifier(esFixins[ef], SUB_FIXINS_IDS);
+        var efid = efkey ? SUB_FIXINS_IDS[efkey] : null;
+        esMods.push({name: esFixins[ef], modifier_id: efid, group: "Sub Fixins", price: 0});
+      }
+      if (extraSubs[es].cheese) {
+        var eckey = resolveModifier(extraSubs[es].cheese, CHEESE_IDS);
+        var ecid = eckey ? CHEESE_IDS[eckey] : null;
+        esMods.push({name: extraSubs[es].cheese, modifier_id: ecid, group: "Cheese Options", price: 0});
+      }
+      var esIs12 = (subSize === "whole" || subSize === "12");
+      var esComp = {
+        component_name: (esIs12 ? "12 inch Whole " : "8 inch Half ") + esub.name,
+        item_id: String(esub.id), category: "Submarines", modifiers: esMods
+      };
+      if (extraSubs[es].special) esComp.special_instructions = extraSubs[es].special;
+      components.push(esComp);
+    }
+
     // ── Build wings component ──
     if (wingFlavor) {
       var wingCount = deal.wings || (dealType.indexOf("combo deal") !== -1 ? (pizzaSize <= 12 ? 6 : 8) : 0);
@@ -2199,6 +2231,17 @@ app.post("/retell/function/calculate_combo", function (req, res) {
       } else {
         components.push({component_name: "French Fries", item_id: "607", category: "Sides"});
       }
+      // Multi-sub combos: add extra fries (2 sub = 2 fries, 3 sub = 3 fries)
+      var sc = deal.sub_count || 1;
+      for (var fi = 1; fi < sc; fi++) {
+        if (friesUpgrade && FRIES_UPGRADES[friesUpgrade]) {
+          var uf = FRIES_UPGRADES[friesUpgrade];
+          totalExtra += 2.00;
+          components.push({component_name: uf.name + " +$2.00 upgrade", item_id: uf.id, category: "Sides"});
+        } else {
+          components.push({component_name: "French Fries", item_id: "607", category: "Sides"});
+        }
+      }
     }
 
     // ── Build soda components ──
@@ -2210,6 +2253,10 @@ app.post("/retell/function/calculate_combo", function (req, res) {
       if (sodaFlavor2) {
         var sodaMods2 = [{name: sodaFlavor2, group: "Soda Can", price: 0}];
         components.push({component_name: "Can Soda", item_id: "728", category: "Beverages", modifiers: sodaMods2});
+      }
+      if (sodaFlavor3) {
+        var sodaMods3 = [{name: sodaFlavor3, group: "Soda Can", price: 0}];
+        components.push({component_name: "Can Soda", item_id: "728", category: "Beverages", modifiers: sodaMods3});
       }
     }
     if (deal.includes_2l || twoLiterFlavor) {
