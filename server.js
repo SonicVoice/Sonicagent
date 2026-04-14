@@ -5,7 +5,7 @@ app.use(express.json({ limit: "50mb" }));
 
 // ═══════════════════════════════════════════════════
 // DATABASE CONNECTION — loads menu into memory at startup
-// Falls back to hardcoded data if database is unavailable
+// Falls back to hardcoded data if database is unavailable.
 // ═══════════════════════════════════════════════════
 var Pool = null;
 var pool = null;
