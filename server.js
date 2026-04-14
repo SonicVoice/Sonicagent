@@ -1,23 +1,18 @@
-// ═══════════════════════════════════════════════════════════════
-// DEMO PIZZA — Server-Driven Voice Orchestrator v2.0
-// Architecture: Retell LLM extracts → Server decides → LLM speaks
-// ═══════════════════════════════════════════════════════════════
-
+// VERSION: V16-2026-03-28 — Database-backed pricing engine
 var express = require("express");
-// fetch is built-in to Node.js v18+
 var app = express();
-app.use(express.json({ limit: "5mb" }));
+app.use(express.json({ limit: "50mb" }));
 
 // ═══════════════════════════════════════════════════
-// DATABASE — Supabase Postgres, loads menu into memory
-// Falls back to hardcoded data if DB unavailable
+// DATABASE CONNECTION — loads menu into memory at startup
+// Falls back to hardcoded data if database is unavailable
 // ═══════════════════════════════════════════════════
+var Pool = null;
 var pool = null;
 var DB_STATUS = "not configured";
-var MENU_CACHE = { loaded_from: "defaults", loaded_at: null };
 
 try {
-  var { Pool } = require("pg");
+  Pool = require("pg").Pool;
   if (process.env.DATABASE_URL) {
     pool = new Pool({
       connectionString: process.env.DATABASE_URL,
@@ -27,105 +22,37 @@ try {
       connectionTimeoutMillis: 5000
     });
     DB_STATUS = "connecting";
-    console.log("DB: Pool created");
+    console.log("DB: Postgres pool created");
   } else {
+    console.log("DB: No DATABASE_URL set — using hardcoded menu data");
     DB_STATUS = "no DATABASE_URL";
-    console.log("DB: No DATABASE_URL — using hardcoded menu");
   }
 } catch (e) {
+  console.log("DB: pg module not installed — using hardcoded menu data. Run: npm install pg");
   DB_STATUS = "pg not installed";
-  console.log("DB: pg module not found — using hardcoded menu");
 }
 
-// ═══════════════════════════════════════════════════════════════
-// SESSION STORE — per-call state, auto-expires after 30 min
-// ═══════════════════════════════════════════════════════════════
-var SESSIONS = {};
-var SESSION_TTL = 30 * 60 * 1000;
-
-function getSession(callId) {
-  if (!SESSIONS[callId]) {
-    SESSIONS[callId] = {
-      id: callId,
-      state: "greeting",
-      order_type: "pickup",
-      basket: [],
-      pending_items: [],       // items mentioned but not fully collected
-      current_item: null,      // item being collected right now
-      missing_fields: [],      // what we need to ask for current_item
-      declined_deals: [],
-      suggested_deals: [],
-      customer_name: "",
-      customer_phone: "",
-      delivery_address: "",
-      subtotal: 0,
-      tax: 0,
-      delivery_fee: 0,
-      total: 0,
-      payment_method: "cash",
-      payment_ref: "",
-      last_say: "",
-      created: Date.now()
-    };
-  }
-  SESSIONS[callId].touched = Date.now();
-  return SESSIONS[callId];
-}
-
-// Cleanup expired sessions every 5 min
-setInterval(function () {
-  var now = Date.now();
-  for (var k in SESSIONS) {
-    if (now - SESSIONS[k].touched > SESSION_TTL) delete SESSIONS[k];
-  }
-}, 5 * 60 * 1000);
-
-// ═══════════════════════════════════════════════════════════════
-// MENU CACHE — loaded from database, hot-reloadable
-// ═══════════════════════════════════════════════════════════════
-var MENU = {
-  pizzas: [],        // {name, id, prices: {10:p, 12:p, 14:p, 16:p, 18:p}, keywords:[]}
-  specialty: [],     // {name, id, prices: {10:p, 12:p, 14:p, 16:p, 18:p}, keywords:[]}
-  subs: [],          // {name, id, p8, p12, keywords:[], premium:bool}
-  sandwiches: [],    // {name, id, price, keywords:[]}
-  wraps: [],
-  clubs: [],
-  buffalo_wings: [], // {qty, id, price}
-  whole_wings: [],
-  nuggets: [],
-  fish_nuggets: [],
-  tenders: [],
-  salads: [],
-  gyros: [],
-  pasta: [],
-  stromboli: [],
-  quesadillas: [],
-  seafood: [],
-  platters: [],
-  sides: [],
-  desserts: [],
-  beverages: [],
-  deals: {},         // {deal_type: {sizes: {sz: {id, price}}, ...}}
-  toppings: {},      // {size: {name: {id, price}}}
-  topping_prices: {},
-  sub_fixins: {},
-  cheese_options: {},
-  wing_flavors: {},
-  wing_dressings: {},
-  soda_flavors: {},
-  salad_dressings: {},
-  tender_sauces: {},
-  loaded: false
+// In-memory menu cache — populated from DB or hardcoded defaults
+var MENU_CACHE = {
+  items: [],
+  toppings: [],
+  sub_fixins: [],
+  cheese_options: [],
+  wing_flavors: [],
+  wing_dressings: [],
+  soda_flavors: [],
+  salad_dressings: [],
+  tender_sauces: [],
+  sandwich_fixins: [],
+  wrap_fixins: [],
+  combo_deals: [],
+  loaded_from: "defaults",
+  loaded_at: null
 };
-
-// ═══════════════════════════════════════════════════
-// DATABASE LOADER — queries Supabase, rebuilds MENU
-// ═══════════════════════════════════════════════════
 
 async function loadMenuFromDB() {
   if (!pool) return false;
   try {
-    console.log("DB: Loading menu from Supabase...");
     var tables = {
       items: "SELECT * FROM menu_items WHERE active = true ORDER BY id",
       toppings: "SELECT * FROM toppings WHERE active = true ORDER BY id",
@@ -136,1285 +63,141 @@ async function loadMenuFromDB() {
       soda_flavors: "SELECT * FROM soda_flavors ORDER BY id",
       salad_dressings: "SELECT * FROM salad_dressings WHERE active = true ORDER BY id",
       tender_sauces: "SELECT * FROM tender_sauces ORDER BY id",
+      sandwich_fixins: "SELECT * FROM sandwich_fixins WHERE active = true ORDER BY id",
+      wrap_fixins: "SELECT * FROM wrap_fixins WHERE active = true ORDER BY id",
       combo_deals: "SELECT * FROM combo_deals WHERE active = true ORDER BY id"
     };
-    var cache = {};
     for (var key in tables) {
-      try {
-        var result = await pool.query(tables[key]);
-        cache[key] = result.rows;
-      } catch (e) {
-        console.log("DB: Table " + key + " error: " + e.message);
-        cache[key] = [];
-      }
+      var result = await pool.query(tables[key]);
+      MENU_CACHE[key] = result.rows;
     }
-    
-    if (!cache.items || cache.items.length === 0) {
-      console.log("DB: No items found — falling back to hardcoded");
-      return false;
-    }
-
-    rebuildMenuFromDB(cache);
     MENU_CACHE.loaded_from = "database";
     MENU_CACHE.loaded_at = new Date().toISOString();
-    MENU_CACHE.counts = {
-      items: cache.items.length, toppings: cache.toppings.length,
-      sub_fixins: cache.sub_fixins.length, cheese_options: cache.cheese_options.length,
-      wing_flavors: cache.wing_flavors.length, soda_flavors: cache.soda_flavors.length,
-      combo_deals: cache.combo_deals.length
-    };
     DB_STATUS = "connected";
-    console.log("DB: Loaded " + cache.items.length + " items, " + cache.combo_deals.length + " deals from Supabase");
+    
+    // Rebuild in-memory lookup structures from DB data
+    rebuildLookupsFromCache();
+    
+    console.log("DB: Menu loaded — " + MENU_CACHE.items.length + " items, " + MENU_CACHE.toppings.length + " toppings, " + MENU_CACHE.combo_deals.length + " deals");
     return true;
   } catch (e) {
-    console.log("DB: Load failed: " + e.message);
+    console.error("DB: Failed to load menu —", e.message);
     DB_STATUS = "error: " + e.message;
     return false;
   }
 }
 
-function rebuildMenuFromDB(cache) {
-  // Clear all arrays
-  MENU.pizzas = []; MENU.specialty = []; MENU.subs = [];
-  MENU.sandwiches = []; MENU.wraps = []; MENU.clubs = [];
-  MENU.buffalo_wings = []; MENU.whole_wings = [];
-  MENU.nuggets = []; MENU.fish_nuggets = []; MENU.tenders = [];
-  MENU.salads = []; MENU.gyros = []; MENU.pasta = [];
-  MENU.stromboli = []; MENU.quesadillas = [];
-  MENU.seafood = []; MENU.platters = []; MENU.sides = [];
-  MENU.desserts = []; MENU.beverages = [];
-
-  // Rebuild items from DB rows
-  for (var i = 0; i < cache.items.length; i++) {
-    var row = cache.items[i];
-    var kw = row.keywords || [];
-    var type = (row.item_type || "").toLowerCase();
-    var cat = (row.category || "").toLowerCase();
-
-    if (type === "cheese_pizza" || type === "cheese pizza") {
-      MENU.pizzas = [{
-        name: row.item_name, keywords: kw,
-        prices: {10:+row.price_10,12:+row.price_12,14:+row.price_14,16:+row.price_16,18:+row.price_18},
-        ids: {10:row.pos_id,12:row.pos_id+1,14:row.pos_id+2,16:row.pos_id+3,18:row.pos_id+4}
-      }];
-      // Rebuild per-size IDs from DB if we have separate rows
-      continue;
-    }
-
-    if (type === "specialty" || type === "specialty_pizza") {
-      MENU.specialty.push({
-        name:row.item_name, id:row.pos_id, keywords:kw,
-        prices:{10:+row.price_10||0,12:+row.price_12||0,14:+row.price_14||0,16:+row.price_16||0,18:+row.price_18||0}
-      });
-      continue;
-    }
-
-    if (type === "sub" || cat === "submarines" || cat === "subs") {
-      MENU.subs.push({
-        name:row.item_name, id:row.pos_id, keywords:kw, premium:!!row.premium,
-        p8:+(row.price_8||row.price_default||0), p12:+(row.price_12||row.price_default||0)
-      });
-      continue;
-    }
-
-    if (type === "buffalo_wings" || type === "buffalo wings") {
-      MENU.buffalo_wings.push({qty:+(row.item_name.match(/\d+/)||[0])[0], id:row.pos_id, price:+row.price_default});
-      continue;
-    }
-    if (type === "whole_wings" || type === "whole wings") {
-      MENU.whole_wings.push({qty:+(row.item_name.match(/\d+/)||[0])[0], id:row.pos_id, price:+row.price_default});
-      continue;
-    }
-    if (type === "nuggets" || type === "chicken_nuggets") {
-      MENU.nuggets.push({qty:+(row.item_name.match(/\d+/)||[0])[0], id:row.pos_id, price:+row.price_default});
-      continue;
-    }
-    if (type === "fish_nuggets") {
-      MENU.fish_nuggets.push({qty:+(row.item_name.match(/\d+/)||[0])[0], id:row.pos_id, price:+row.price_default});
-      continue;
-    }
-    if (type === "tenders" || type === "chicken_tenders") {
-      MENU.tenders.push({qty:+(row.item_name.match(/\d+/)||[0])[0], id:row.pos_id, price:+row.price_default});
-      continue;
-    }
-
-    // Generic items with single price
-    var item = {name:row.item_name, id:row.pos_id, price:+row.price_default, keywords:kw};
-    if (cat === "sandwiches" || type === "sandwich") MENU.sandwiches.push(item);
-    else if (cat === "wraps" || type === "wrap") MENU.wraps.push(item);
-    else if (cat === "clubs" || type === "club") MENU.clubs.push(item);
-    else if (cat === "salads" || type === "salad") MENU.salads.push(item);
-    else if (cat === "gyro" || cat === "gyros" || type === "gyro") MENU.gyros.push(item);
-    else if (cat === "pasta" || type === "pasta") MENU.pasta.push(item);
-    else if (cat === "stromboli" || type === "stromboli") MENU.stromboli.push(item);
-    else if (cat === "quesadillas" || type === "quesadilla") MENU.quesadillas.push(item);
-    else if (cat === "seafood" && type === "platter") MENU.platters.push(item);
-    else if (cat === "seafood" || type === "seafood") MENU.seafood.push(item);
-    else if (cat === "sides" || type === "side") MENU.sides.push(item);
-    else if (cat === "desserts" || type === "dessert") MENU.desserts.push(item);
-    else if (cat === "beverages" || type === "beverage" || type === "drink") MENU.beverages.push(item);
+function rebuildLookupsFromCache() {
+  // Rebuild SUBS_DB from database
+  var dbSubs = MENU_CACHE.items.filter(function(i) { return i.item_type === "sub"; });
+  if (dbSubs.length > 0) {
+    SUBS_DB = dbSubs.map(function(s) {
+      return {
+        keys: s.keywords || [],
+        id: s.pos_id,
+        name: s.item_name,
+        p8: parseFloat(s.price_8 || 0),
+        p12: parseFloat(s.price_12 || 0)
+      };
+    });
+    // Sort by longest keyword first (so "shrimp cheese steak" matches before "cheese steak")
+    SUBS_DB.sort(function(a, b) {
+      var aMax = Math.max.apply(null, a.keys.map(function(k) { return k.length; }));
+      var bMax = Math.max.apply(null, b.keys.map(function(k) { return k.length; }));
+      return bMax - aMax;
+    });
+    console.log("DB: Rebuilt SUBS_DB with " + SUBS_DB.length + " subs");
   }
-
-  // Rebuild toppings from DB
-  if (cache.toppings && cache.toppings.length > 0) {
-    MENU.topping_prices = {10:{},12:{},14:{},16:{},18:{}};
-    MENU.topping_ids = {10:{},12:{},14:{},16:{},18:{}};
-    for (var t = 0; t < cache.toppings.length; t++) {
-      var tp = cache.toppings[t];
-      var tn = norm(tp.topping_name);
-      if (tp.is_free) {
-        if (FREE_TOPPINGS.indexOf(tn) === -1) FREE_TOPPINGS.push(tn);
-      } else {
-        MENU.topping_prices[10].full = +tp.price_10; MENU.topping_prices[10].half = +tp.half_price_10;
-        MENU.topping_prices[12].full = +tp.price_12; MENU.topping_prices[12].half = +tp.half_price_12;
-        MENU.topping_prices[14].full = +tp.price_14; MENU.topping_prices[14].half = +tp.half_price_14;
-        MENU.topping_prices[16].full = +tp.price_16; MENU.topping_prices[16].half = +tp.half_price_16;
-        MENU.topping_prices[18].full = +tp.price_18; MENU.topping_prices[18].half = +tp.half_price_18;
-        if (tn === "shrimp" || tn === "anchovy") {
-          [10,12,14,16,18].forEach(function(sz) {
-            MENU.topping_prices[sz][tn] = +tp["price_" + sz];
-          });
-        }
+  
+  // Rebuild TOPPING_PRICES and TOPPING_IDS from database
+  if (MENU_CACHE.toppings.length > 0) {
+    TOPPING_PRICES = {10:{},12:{},14:{},16:{},18:{}};
+    TOPPING_IDS = {10:{},12:{},14:{},16:{},18:{}};
+    FREE_TOPPINGS = [];
+    
+    MENU_CACHE.toppings.forEach(function(t) {
+      var norm = normTopping(t.topping_name);
+      if (t.is_free) {
+        FREE_TOPPINGS.push(norm);
+        [10,12,14,16,18].forEach(function(sz) {
+          TOPPING_IDS[sz][norm] = t["mod_id_" + sz] || null;
+        });
+        return;
       }
       [10,12,14,16,18].forEach(function(sz) {
-        if (tp["mod_id_" + sz]) MENU.topping_ids[sz][tn] = tp["mod_id_" + sz];
+        TOPPING_PRICES[sz][norm] = {
+          full: parseFloat(t["price_" + sz] || 0),
+          half: parseFloat(t["half_price_" + sz] || 0)
+        };
+        TOPPING_IDS[sz][norm] = t["mod_id_" + sz] || null;
       });
-    }
-  }
-
-  // Rebuild modifier lookups from DB
-  if (cache.sub_fixins && cache.sub_fixins.length > 0) {
-    MENU.sub_fixins = {};
-    for (var sf = 0; sf < cache.sub_fixins.length; sf++) {
-      MENU.sub_fixins[norm(cache.sub_fixins[sf].fixin_name)] = cache.sub_fixins[sf].modifier_id;
-    }
-  }
-  if (cache.cheese_options && cache.cheese_options.length > 0) {
-    MENU.cheese_options = {};
-    for (var co = 0; co < cache.cheese_options.length; co++) {
-      MENU.cheese_options[norm(cache.cheese_options[co].cheese_name)] = cache.cheese_options[co].modifier_id;
-    }
-  }
-  if (cache.wing_flavors && cache.wing_flavors.length > 0) {
-    MENU.wing_flavors = {};
-    for (var wf = 0; wf < cache.wing_flavors.length; wf++) {
-      MENU.wing_flavors[norm(cache.wing_flavors[wf].flavor_name)] = cache.wing_flavors[wf].modifier_id;
-    }
-  }
-  if (cache.wing_dressings && cache.wing_dressings.length > 0) {
-    MENU.wing_dressings = {};
-    for (var wd = 0; wd < cache.wing_dressings.length; wd++) {
-      MENU.wing_dressings[norm(cache.wing_dressings[wd].dressing_name)] = cache.wing_dressings[wd].modifier_id;
-    }
-  }
-  if (cache.soda_flavors && cache.soda_flavors.length > 0) {
-    MENU.soda_flavors = {};
-    for (var sv = 0; sv < cache.soda_flavors.length; sv++) {
-      MENU.soda_flavors[norm(cache.soda_flavors[sv].flavor_name)] = cache.soda_flavors[sv].modifier_id;
-    }
-  }
-  if (cache.salad_dressings && cache.salad_dressings.length > 0) {
-    MENU.salad_dressings = {};
-    for (var sd = 0; sd < cache.salad_dressings.length; sd++) {
-      MENU.salad_dressings[norm(cache.salad_dressings[sd].dressing_name)] = cache.salad_dressings[sd].modifier_id;
-    }
-  }
-  if (cache.tender_sauces && cache.tender_sauces.length > 0) {
-    MENU.tender_sauces = {};
-    for (var ts = 0; ts < cache.tender_sauces.length; ts++) {
-      MENU.tender_sauces[norm(cache.tender_sauces[ts].sauce_name)] = cache.tender_sauces[ts].modifier_id;
-    }
-  }
-
-  // Rebuild deals from DB
-  if (cache.combo_deals && cache.combo_deals.length > 0) {
-    MENU.deals = {};
-    for (var cd = 0; cd < cache.combo_deals.length; cd++) {
-      var deal = cache.combo_deals[cd];
-      var dt = deal.deal_type;
-      if (!MENU.deals[dt]) {
-        MENU.deals[dt] = { sizes: {}, freeToppings: deal.free_toppings || 0 };
-        if (deal.includes_fries) MENU.deals[dt].includes_fries = true;
-        if (deal.includes_can) MENU.deals[dt].includes_can = true;
-        if (deal.includes_2l) MENU.deals[dt].includes_2l = true;
-        if (deal.pizza_count) MENU.deals[dt].pizzas = deal.pizza_count;
-        if (deal.wing_count) MENU.deals[dt].wings = deal.wing_count;
-      }
-      var sizeKey = deal.pizza_size || 0;
-      MENU.deals[dt].sizes[sizeKey] = { id: deal.deal_pos_id, price: +deal.price };
-    }
-  }
-
-  // Rebuild cheese pizza IDs (separate rows per size in DB)
-  if (MENU.pizzas.length === 0) {
-    // Build from items with type cheese_pizza_10, cheese_pizza_12, etc.
-    var cpPrices = {}, cpIds = {};
-    for (var ci = 0; ci < cache.items.length; ci++) {
-      var cr = cache.items[ci];
-      if ((cr.item_type || "").indexOf("cheese_pizza") !== -1) {
-        var csz = +(cr.item_type.match(/\d+/)||[14])[0];
-        cpPrices[csz] = +cr.price_default;
-        cpIds[csz] = cr.pos_id;
-      }
-    }
-    if (Object.keys(cpPrices).length > 0) {
-      MENU.pizzas = [{name:"Cheese Pizza", keywords:["cheese pizza","plain pizza","just cheese"], prices:cpPrices, ids:cpIds}];
-    }
-  }
-
-  MENU.loaded = true;
-  console.log("DB: Menu rebuilt — " + MENU.subs.length + " subs, " + MENU.specialty.length + " specialty, " + Object.keys(MENU.deals).length + " deals");
-}
-
-async function loadMenu() {
-  try {
-    // Try database first
-    var dbLoaded = await loadMenuFromDB();
-    if (dbLoaded) return true;
-    console.log("DB: Using hardcoded defaults");
-
-    // ── PIZZA PRICES ──
-    MENU.pizzas = [{name:"Cheese Pizza", keywords:["cheese pizza","plain pizza","just cheese"],
-      prices:{10:8.99, 12:10.99, 14:11.99, 16:13.99, 18:14.99},
-      ids:{10:735, 12:736, 14:737, 16:738, 18:739}}];
-    
-    // ── SPECIALTY PIZZAS ──
-    MENU.specialty = [
-      {name:"Deluxe",id:655,prices:{10:12.99,12:15.99,14:17.99,16:19.99,18:21.99},keywords:["deluxe"]},
-      {name:"Steak",id:656,prices:{10:13.99,12:16.99,14:18.99,16:20.99,18:22.99},keywords:["steak pizza"]},
-      {name:"Unique",id:657,prices:{10:12.99,12:15.99,14:17.99,16:19.99,18:21.99},keywords:["unique"]},
-      {name:"Supreme",id:658,prices:{10:12.99,12:15.99,14:17.99,16:19.99,18:21.99},keywords:["supreme"]},
-      {name:"Veggie",id:659,prices:{10:12.99,12:15.99,14:17.99,16:19.99,18:21.99},keywords:["veggie pizza"]},
-      {name:"Philly CS",id:660,prices:{10:13.99,12:16.99,14:18.99,16:20.99,18:22.99},keywords:["philly cheese steak pizza"]},
-      {name:"Hawaiian",id:661,prices:{10:12.99,12:15.99,14:17.99,16:19.99,18:21.99},keywords:["hawaiian"]},
-      {name:"NY Style",id:662,prices:{10:12.99,12:15.99,14:17.99,16:19.99,18:21.99},keywords:["new york","ny style"]},
-      {name:"Chicken Bacon Ranch",id:663,prices:{10:13.99,12:16.99,14:18.99,16:20.99,18:22.99},keywords:["chicken bacon ranch","cbr"]},
-      {name:"Buffalo Chicken",id:664,prices:{10:12.99,12:15.99,14:17.99,16:19.99,18:21.99},keywords:["buffalo chicken pizza"]},
-      {name:"BBQ Chicken",id:666,prices:{10:12.99,12:15.99,14:17.99,16:19.99,18:21.99},keywords:["bbq chicken pizza"]},
-      {name:"Meal Buster",id:667,prices:{10:14.99,12:17.99,14:19.99,16:22.99,18:24.99},keywords:["meal buster"]},
-      {name:"Meat Lover",id:829,prices:{10:13.99,12:16.99,14:18.99,16:20.99,18:22.99},keywords:["meat lover"]}
-    ];
-
-    // ── SUBS ──
-    MENU.subs = [
-      {name:"Shrimp Cheese Steak Sub",id:726,p8:9.99,p12:14.49,premium:true,keywords:["shrimp cheese steak","shrimp cheesesteak","shrimp cs"]},
-      {name:"Philly Cheese Steak Sub",id:723,p8:9.49,p12:13.99,premium:true,keywords:["philly cheese steak","philly cheesesteak","philly cs","philly sub"]},
-      {name:"Philly Chicken Sub",id:724,p8:9.49,p12:13.99,premium:true,keywords:["philly chicken"]},
-      {name:"Cheese Steak Special Sub",id:725,p8:9.49,p12:13.49,premium:true,keywords:["cheese steak special","cs special"]},
-      {name:"Shrimp Salad Sub",id:710,p8:8.99,p12:12.99,premium:true,keywords:["shrimp salad sub","shrimp salad"]},
-      {name:"Cheese Steak Sub",id:684,p8:8.49,p12:12.49,premium:false,keywords:["cheese steak","cheesesteak","cs sub"]},
-      {name:"Chicken Cheese Steak Sub",id:685,p8:8.49,p12:12.49,premium:false,keywords:["chicken cheese steak","chicken cheesesteak"]},
-      {name:"Cheese Burger Sub",id:686,p8:8.49,p12:12.49,premium:false,keywords:["cheese burger sub","cheeseburger sub"]},
-      {name:"Cheese Fish Sub",id:801,p8:8.49,p12:12.49,premium:false,keywords:["cheese fish sub","cheese fish","fish sub"]},
-      {name:"Steak Sub",id:687,p8:8.49,p12:12.49,premium:false,keywords:["steak sub"]},
-      {name:"Grilled Chicken Sub",id:692,p8:8.49,p12:12.49,premium:false,keywords:["grilled chicken sub","chicken sub"]},
-      {name:"Chicken Fillet Sub",id:693,p8:8.49,p12:12.49,premium:false,keywords:["chicken fillet"]},
-      {name:"Chicken Parmesan Sub",id:691,p8:8.49,p12:12.49,premium:false,keywords:["chicken parmesan","chicken parm"]},
-      {name:"Crab Cake Sub",id:833,p8:9.49,p12:13.49,premium:false,keywords:["crab cake sub","crab sub"]},
-      {name:"Veggie Sub",id:727,p8:8.49,p12:12.49,premium:false,keywords:["veggie sub"]},
-      {name:"Hamburger Sub",id:688,p8:7.99,p12:11.99,premium:false,keywords:["hamburger sub"]},
-      {name:"Meat Ball Sub",id:689,p8:7.99,p12:11.99,premium:false,keywords:["meatball","meat ball"]},
-      {name:"Turkey Burger Sub",id:690,p8:7.99,p12:11.99,premium:false,keywords:["turkey burger sub"]},
-      {name:"Pizza Sub",id:694,p8:7.99,p12:11.99,premium:false,keywords:["pizza sub"]},
-      {name:"Chilli Sub",id:695,p8:7.99,p12:11.99,premium:false,keywords:["chilli sub","chili sub"]},
-      {name:"Italian Cold Cut Sub",id:702,p8:7.99,p12:11.99,premium:false,keywords:["italian cold cut","italian cold"]},
-      {name:"Italian Hot Cut Sub",id:703,p8:7.99,p12:11.99,premium:false,keywords:["italian hot cut","italian hot"]},
-      {name:"Turkey Breast Sub",id:704,p8:7.99,p12:11.99,premium:false,keywords:["turkey breast","turkey sub"]},
-      {name:"Ham and Cheese Sub",id:705,p8:7.99,p12:11.99,premium:false,keywords:["ham and cheese","ham cheese","ham sub"]},
-      {name:"Tuna Salad Sub",id:706,p8:7.99,p12:11.99,premium:false,keywords:["tuna salad sub","tuna sub"]},
-      {name:"Chicago Cold Cut Sub",id:707,p8:8.49,p12:12.49,premium:false,keywords:["chicago cold cut","chicago sub"]},
-      {name:"Chicken Salad Sub",id:708,p8:7.99,p12:11.99,premium:false,keywords:["chicken salad sub"]},
-      {name:"Chipotle Sub",id:709,p8:8.49,p12:12.49,premium:false,keywords:["chipotle sub","chipotle"]},
-      {name:"Regular Cold Cut Sub",id:825,p8:7.49,p12:10.99,premium:false,keywords:["regular cold cut","american cold cut"]},
-      {name:"Regular Hot Cut Sub",id:826,p8:7.49,p12:10.99,premium:false,keywords:["regular hot cut","american hot cut"]}
-    ];
-
-    // ── SANDWICHES ──
-    MENU.sandwiches = [
-      {name:"Crab Cake Sandwich",id:711,price:5.99,keywords:["crab cake sandwich"]},
-      {name:"Hamburger Sandwich",id:712,price:4.99,keywords:["hamburger sandwich","quarter pound"]},
-      {name:"Cheese Burger Sandwich",id:713,price:4.99,keywords:["cheese burger sandwich","cheeseburger sandwich","cheeseburger"]},
-      {name:"Turkey Burger Sandwich",id:714,price:4.99,keywords:["turkey burger sandwich"]},
-      {name:"Grilled Chicken Sandwich",id:715,price:5.99,keywords:["grilled chicken sandwich"]},
-      {name:"Crispy Chicken Sandwich",id:716,price:5.99,keywords:["crispy chicken sandwich"]},
-      {name:"Fried Fish Sandwich",id:717,price:5.99,keywords:["fried fish sandwich"]},
-      {name:"Cheese Fish Sandwich",id:718,price:5.99,keywords:["cheese fish sandwich"]},
-      {name:"BLT Sandwich",id:719,price:5.99,keywords:["blt sandwich","blt"]},
-      {name:"Hot Dog",id:720,price:5.99,keywords:["hot dog"]},
-      {name:"Grilled Shrimp Sandwich",id:721,price:6.99,keywords:["grilled shrimp sandwich"]},
-      {name:"Fried Shrimp Sandwich",id:722,price:8.99,keywords:["fried shrimp sandwich"]}
-    ];
-
-    // ── WRAPS ──
-    MENU.wraps = [
-      {name:"Grilled Chicken Caesar Wrap",id:623,price:9.49,keywords:["chicken caesar wrap"]},
-      {name:"Veggie Wrap",id:624,price:9.49,keywords:["veggie wrap"]},
-      {name:"Cheese Steak Wrap",id:625,price:9.49,keywords:["cheese steak wrap"]},
-      {name:"Chicken Cheese Steak Wrap",id:626,price:9.49,keywords:["chicken cheese steak wrap"]},
-      {name:"Italian Cold Cut Wrap",id:627,price:9.49,keywords:["italian cold cut wrap"]},
-      {name:"Cheese Burger Wrap",id:628,price:9.49,keywords:["cheese burger wrap"]},
-      {name:"Buffalo Chicken Wrap",id:629,price:9.49,keywords:["buffalo chicken wrap"]},
-      {name:"Chipotle CS Wrap",id:630,price:7.99,keywords:["chipotle wrap"]},
-      {name:"Ranchero Chicken Wrap",id:631,price:9.49,keywords:["ranchero wrap"]},
-      {name:"Turkey Wrap",id:812,price:9.49,keywords:["turkey wrap"]},
-      {name:"Tuna Wrap",id:813,price:9.49,keywords:["tuna wrap"]},
-      {name:"Shrimp Salad Wrap",id:814,price:11.99,keywords:["shrimp salad wrap"]}
-    ];
-
-    // ── CLUBS ──
-    MENU.clubs = [
-      {name:"Turkey Club",id:696,price:10.99,keywords:["turkey club"]},
-      {name:"Ham Club",id:697,price:10.99,keywords:["ham club"]},
-      {name:"Grilled Chicken Club",id:698,price:8.99,keywords:["grilled chicken club","chicken club"]},
-      {name:"BLT Club",id:699,price:10.99,keywords:["blt club"]},
-      {name:"Tuna Club",id:700,price:10.99,keywords:["tuna club"]},
-      {name:"Chicken Salad Club",id:701,price:9.99,keywords:["chicken salad club"]}
-    ];
-
-    // ── WINGS ──
-    MENU.buffalo_wings = [
-      {qty:6,id:579,price:8.99},{qty:9,id:580,price:12.99},{qty:12,id:581,price:14.99},
-      {qty:18,id:582,price:21.99},{qty:24,id:583,price:25.99},{qty:36,id:584,price:36.99},
-      {qty:48,id:585,price:46.99},{qty:50,id:586,price:48.99}
-    ];
-    MENU.whole_wings = [
-      {qty:4,id:591,price:9.99},{qty:6,id:592,price:12.99},{qty:8,id:593,price:15.99},
-      {qty:10,id:594,price:15.99},{qty:12,id:595,price:24.99},{qty:15,id:596,price:28.99},
-      {qty:20,id:597,price:36.99},{qty:30,id:598,price:50.99}
-    ];
-
-    // ── TENDERS / NUGGETS ──
-    MENU.tenders = [{qty:3,id:672,price:7.49},{qty:5,id:673,price:10.49},{qty:7,id:674,price:12.49}];
-    MENU.nuggets = [{qty:6,id:587,price:5.99},{qty:9,id:588,price:6.99},{qty:12,id:824,price:8.99}];
-    MENU.fish_nuggets = [{qty:5,id:589,price:7.99},{qty:10,id:590,price:12.99}];
-
-    // ── SALADS ──
-    MENU.salads = [
-      {name:"Garden Salad",id:635,price:6.99,keywords:["garden salad","garden"]},
-      {name:"Caesar Salad",id:634,price:7.99,keywords:["caesar salad"]},
-      {name:"Greek Salad",id:633,price:9.99,keywords:["greek salad","greek"]},
-      {name:"Grilled Chicken Garden Salad",id:636,price:9.99,keywords:["chicken garden salad"]},
-      {name:"Grilled Chicken Salad",id:637,price:9.99,keywords:["grilled chicken salad"]},
-      {name:"Crispy Chicken Salad",id:638,price:9.99,keywords:["crispy chicken salad"]},
-      {name:"Chef Salad",id:639,price:9.99,keywords:["chef salad"]},
-      {name:"Tuna on Garden Salad",id:640,price:9.99,keywords:["tuna salad","tuna garden"]},
-      {name:"Fried Shrimp Salad",id:641,price:10.99,keywords:["fried shrimp salad","shrimp salad"]}
-    ];
-
-    // ── GYROS ──
-    MENU.gyros = [
-      {name:"Chicken Gyro",id:653,price:9.49,keywords:["chicken gyro"]},
-      {name:"Lamb Gyro",id:654,price:9.49,keywords:["lamb gyro"]},
-      {name:"Chicken Gyro Platter",id:796,price:10.49,keywords:["chicken gyro platter"]},
-      {name:"Lamb Gyro Platter",id:797,price:10.49,keywords:["lamb gyro platter"]}
-    ];
-
-    // ── PASTA ──
-    MENU.pasta = [
-      {name:"Marinara Spaghetti",id:815,price:8.99,keywords:["marinara spaghetti"]},
-      {name:"Marinara Lasagna",id:816,price:9.99,keywords:["marinara lasagna"]},
-      {name:"Chicken Alfredo",id:576,price:9.99,keywords:["chicken alfredo"]},
-      {name:"Meat Sauce Spaghetti",id:570,price:10.99,keywords:["meat sauce spaghetti"]},
-      {name:"Meat Sauce Lasagna",id:571,price:11.99,keywords:["meat sauce lasagna"]},
-      {name:"Chicken Parm Spaghetti",id:572,price:10.99,keywords:["chicken parm spaghetti","chicken parmesan spaghetti"]},
-      {name:"Chicken Parm Lasagna",id:817,price:11.99,keywords:["chicken parm lasagna"]},
-      {name:"Meatball Spaghetti",id:573,price:10.99,keywords:["meatball spaghetti"]},
-      {name:"Meatball Lasagna",id:578,price:11.99,keywords:["meatball lasagna"]},
-      {name:"Mushroom Spaghetti",id:574,price:10.99,keywords:["mushroom spaghetti"]},
-      {name:"Mushroom Lasagna",id:818,price:11.99,keywords:["mushroom lasagna"]},
-      {name:"Shrimp Spaghetti",id:575,price:12.99,keywords:["shrimp spaghetti"]},
-      {name:"Shrimp Alfredo",id:577,price:12.99,keywords:["shrimp alfredo"]},
-      {name:"Shrimp Lasagna",id:819,price:13.99,keywords:["shrimp lasagna"]}
-    ];
-
-    // ── STROMBOLI ──
-    MENU.stromboli = [
-      {name:"Regular Stromboli",id:668,price:9.99,keywords:["regular stromboli","beef stromboli"]},
-      {name:"Veggie Stromboli",id:669,price:13.99,keywords:["veggie stromboli"]},
-      {name:"Philly CS Stromboli",id:670,price:14.99,keywords:["philly stromboli"]},
-      {name:"Chicken Stromboli",id:671,price:14.99,keywords:["chicken stromboli"]}
-    ];
-
-    // ── QUESADILLAS ──
-    MENU.quesadillas = [
-      {name:"Chicken Quesadilla",id:678,price:10.99,keywords:["chicken quesadilla"]},
-      {name:"Buffalo Chicken Quesadilla",id:679,price:8.99,keywords:["buffalo chicken quesadilla"]},
-      {name:"Steak Quesadilla",id:680,price:10.99,keywords:["steak quesadilla"]},
-      {name:"Veggie Quesadilla",id:681,price:10.99,keywords:["veggie quesadilla"]},
-      {name:"Shrimp Quesadilla",id:682,price:11.99,keywords:["shrimp quesadilla"]}
-    ];
-
-    // ── SEAFOOD ──
-    MENU.seafood = [
-      {name:"2pc Tilapia",id:642,price:10.99,keywords:["2 tilapia"]},
-      {name:"3pc Tilapia",id:643,price:13.99,keywords:["3 tilapia"]},
-      {name:"5pc Tilapia",id:644,price:19.99,keywords:["5 tilapia"]},
-      {name:"2pc Catfish",id:645,price:9.99,keywords:["2 catfish"]},
-      {name:"3pc Catfish",id:646,price:13.99,keywords:["3 catfish"]},
-      {name:"5pc Catfish",id:647,price:19.99,keywords:["5 catfish"]},
-      {name:"2pc Whiting",id:648,price:9.99,keywords:["2 whiting"]},
-      {name:"3pc Whiting",id:649,price:13.99,keywords:["3 whiting"]},
-      {name:"5pc Whiting",id:650,price:19.99,keywords:["5 whiting"]},
-      {name:"3pc Lake Trout",id:651,price:13.99,keywords:["3 lake trout","lake trout"]},
-      {name:"5pc Lake Trout",id:652,price:19.99,keywords:["5 lake trout"]}
-    ];
-
-    // ── PLATTERS ──
-    MENU.platters = [
-      {name:"Jumbo Fried Shrimp Platter",id:675,price:12.99,keywords:["shrimp platter","jumbo shrimp"]},
-      {name:"Shrimp Basket",id:676,price:9.99,keywords:["shrimp basket"]},
-      {name:"Crab Cake Platter",id:677,price:12.99,keywords:["crab cake platter","crab platter"]},
-      {name:"Lake Trout Platter",id:820,price:11.99,keywords:["trout platter"]},
-      {name:"Whiting Platter",id:821,price:10.99,keywords:["whiting platter"]},
-      {name:"Catfish Platter",id:822,price:11.99,keywords:["catfish platter"]},
-      {name:"Tilapia Platter",id:823,price:11.99,keywords:["tilapia platter"]}
-    ];
-
-    // ── SIDES ──
-    MENU.sides = [
-      {name:"French Fries",id:607,price:2.99,keywords:["french fries","fries","regular fries"]},
-      {name:"Large French Fries",id:830,price:4.49,keywords:["large fries"]},
-      {name:"Western Fries Small",id:614,price:3.49,keywords:["western small","small western"]},
-      {name:"Western Fries",id:608,price:5.49,keywords:["western fries","western"]},
-      {name:"Gravy Fries",id:609,price:4.49,keywords:["gravy fries"]},
-      {name:"Cheese Fries",id:811,price:4.49,keywords:["cheese fries"]},
-      {name:"Nacho Fries",id:611,price:4.49,keywords:["nacho fries"]},
-      {name:"Mozzarella Fries",id:612,price:4.49,keywords:["mozzarella fries","mozz fries"]},
-      {name:"Pizza Fries",id:615,price:4.49,keywords:["pizza fries"]},
-      {name:"Crazy Fries",id:613,price:4.49,keywords:["crazy fries"]},
-      {name:"Onion Rings",id:618,price:5.99,keywords:["onion rings","rings"]},
-      {name:"Mozzarella Sticks",id:616,price:6.49,keywords:["mozzarella sticks","mozz sticks"]},
-      {name:"Breaded Mushrooms",id:617,price:5.99,keywords:["breaded mushrooms","fried mushrooms"]},
-      {name:"Breadsticks",id:620,price:3.99,keywords:["breadsticks"]},
-      {name:"Cheese Breadsticks",id:799,price:4.99,keywords:["cheese breadsticks"]},
-      {name:"Garlic Bread",id:621,price:2.99,keywords:["garlic bread"]},
-      {name:"Garlic Bread w Cheese",id:622,price:3.99,keywords:["garlic bread with cheese","cheesy garlic bread"]},
-      {name:"Cole Slaw",id:619,price:2.49,keywords:["coleslaw","cole slaw","slaw"]},
-      {name:"Chips Plain",id:610,price:1.49,keywords:["chips","plain chips"]},
-      {name:"Chips BBQ",id:810,price:1.49,keywords:["bbq chips"]},
-      {name:"Nacho Cheese Cup",id:848,price:1.99,keywords:["nacho cheese"]},
-      {name:"Gravy Cup",id:849,price:1.49,keywords:["gravy","side of gravy"]}
-    ];
-
-    // ── DESSERTS ──
-    MENU.desserts = [
-      {name:"Sweet Potato Pie",id:600,price:3.99,keywords:["sweet potato","potato pie"]},
-      {name:"Cheese Cake",id:601,price:3.99,keywords:["cheesecake","cheese cake"]},
-      {name:"Chocolate Cake",id:602,price:3.99,keywords:["chocolate cake","chocolate"]},
-      {name:"Carrot Cake",id:603,price:3.99,keywords:["carrot cake"]},
-      {name:"Lemon Cake",id:604,price:3.99,keywords:["lemon cake"]},
-      {name:"Strawberry Cheesecake",id:605,price:3.99,keywords:["strawberry cheesecake","strawberry"]},
-      {name:"Red Velvet Cake",id:606,price:3.99,keywords:["red velvet"]},
-      {name:"Banana Pudding",id:832,price:3.99,keywords:["banana pudding","pudding"]},
-      {name:"Bean Pie",id:851,price:3.99,keywords:["bean pie"]}
-    ];
-
-    // ── BEVERAGES ──
-    MENU.beverages = [
-      {name:"Can Soda",id:728,price:1.00,keywords:["can soda","soda","pop"]},
-      {name:"2 Liter Soda",id:790,price:3.49,keywords:["2 liter","two liter","2l"]},
-      {name:"Spring Water",id:732,price:1.49,keywords:["water","spring water"]},
-      {name:"Lemonade",id:733,price:2.49,keywords:["lemonade"]},
-      {name:"Apple Juice",id:729,price:1.99,keywords:["apple juice"]},
-      {name:"Orange Juice",id:730,price:1.99,keywords:["orange juice","oj"]},
-      {name:"Cranberry Juice",id:731,price:1.99,keywords:["cranberry juice"]}
-    ];
-
-    // ── TOPPING PRICES BY SIZE ──
-    MENU.topping_prices = {
-      10:{full:1.00,half:0.50,shrimp:1.50,anchovy:1.50},
-      12:{full:1.50,half:0.75,shrimp:2.00,anchovy:2.00},
-      14:{full:2.00,half:1.00,shrimp:2.00,anchovy:2.00},
-      16:{full:2.50,half:1.25,shrimp:3.50,anchovy:3.50},
-      18:{full:3.00,half:1.50,shrimp:4.00,anchovy:4.00}
-    };
-
-    // ── TOPPING IDS BY SIZE ──
-    MENU.topping_ids = {
-      10:{ground_beef:749,ham:750,sausage:751,pepperoni:752,black_olives:753,jalapenos:754,green_peppers:755,mushrooms:756,onions:757,chicken:758,pineapple:759,sweet_peppers:760,banana_peppers:761,broccoli:762,spinach:763,bacon:764,extra_cheese:765,tomatoes:766,shrimp:854,anchovy:855},
-      12:{ground_beef:940,ham:941,sausage:942,pepperoni:943,black_olives:944,jalapenos:945,green_peppers:946,mushrooms:947,onions:948,chicken:949,pineapple:950,sweet_peppers:951,banana_peppers:952,broccoli:953,spinach:954,bacon:955,extra_cheese:956,tomatoes:957,shrimp:961,anchovy:962},
-      14:{ground_beef:963,ham:964,sausage:965,pepperoni:966,black_olives:967,jalapenos:968,green_peppers:969,mushrooms:970,onions:971,chicken:972,pineapple:973,sweet_peppers:974,banana_peppers:975,broccoli:976,spinach:977,bacon:978,extra_cheese:979,tomatoes:980,shrimp:984,anchovy:985},
-      16:{ground_beef:986,ham:987,sausage:988,pepperoni:989,black_olives:990,jalapenos:991,green_peppers:992,mushrooms:993,onions:994,chicken:995,pineapple:996,sweet_peppers:997,banana_peppers:998,broccoli:999,spinach:1000,bacon:1001,extra_cheese:1002,tomatoes:1003,shrimp:1007,anchovy:1008},
-      18:{ground_beef:1009,ham:1010,sausage:1011,pepperoni:1012,black_olives:1013,jalapenos:1014,green_peppers:1015,mushrooms:1016,onions:1017,chicken:1018,pineapple:1019,sweet_peppers:1020,banana_peppers:1021,broccoli:1022,spinach:1023,bacon:1024,extra_cheese:1025,tomatoes:1026,shrimp:1030,anchovy:1031}
-    };
-
-    // ── MODIFIER IDS ──
-    MENU.sub_fixins = {everything:463,lettuce:464,tomatoes:465,mayo:466,mustard:467,ketchup:468,onions:469,hot_peppers:470,raw_onions:746,grilled_onions:747,fried_onions:695,everything_no_hots:1302,pickles:1304,salt_n_pepper:1305,extra_meat:471,bacon:472,extra_cheese:473,shrimp:748,ham:744,turkey:745,banana_peppers:1306,green_peppers:1307,black_olives:1308,mushrooms:1309,oil_and_vinegar:1310,tartar_sauce:1311};
-    MENU.cheese_options = {american:488,provolone:489,mozzarella:492,feta:493,no_cheese:491,extra_cheese:490};
-    MENU.wing_flavors = {hot:386,mild:387,bbq:368,honey_bbq:369,honey_mustard:370,lemon_pepper:371,garlic_parmesan:372,old_bay:373,honey_old_bay:374,honey_lemon_pepper:375,general_tsos:376,mango_habanero:377,caribbean_jerk:378,thai_chili:379,buffalo:380,extra_hot:381,jamaican_jerk:382,maryland_style:383,southern_style:384,toxic_waste:385,spicy_bbq:389,spicy_honey_bbq:390,roasted_garlic:391,bourbon:392,honey_garlic:393,no_flavor:394};
-    MENU.wing_dressings = {ranch:397,blue_cheese:398,hot_sauce:696,extra_dressing:399};
-    MENU.soda_flavors = {coke:535,pepsi:536,sprite:537,diet_coke:538,diet_pepsi:539,cherry_coke:540,cherry_pepsi:541,coke_zero:542,mountain_dew:543,dr_pepper:544,root_beer:545,ginger_ale:552,sierra_mist:547,fanta_orange:548,fanta_grape:549,fanta_strawberry:550,fruit_punch:554,half_and_half:555};
-    MENU.salad_dressings = {creamy_italian:362,thousand_island:363,caesar:364,balsamic_vinaigrette:365,ranch:397,blue_cheese:398,french:366,honey_mustard:370};
-    MENU.tender_sauces = {honey_mustard:615,blue_cheese:616,honey_bbq:617,ranch:618};
-
-    // ── DEALS ──
-    MENU.deals = {
-      "double deal":{sizes:{12:{id:786,price:19.99},14:{id:787,price:21.99},16:{id:788,price:24.99},18:{id:788,price:24.99}},pizzas:2,freeToppings:1},
-      "3 pizza special":{sizes:{14:{id:777,price:36.99},16:{id:778,price:38.99}},pizzas:3,freeToppings:1,includes_2l:true},
-      "pizza and wings":{sizes:{12:{id:781,price:25.99},14:{id:782,price:26.99},16:{id:783,price:27.99}},pizzas:1,freeToppings:1,includes_2l:true,wings:10},
-      "pizza and sub":{sizes:{12:{id:784,price:22.99},14:{id:794,price:24.99},16:{id:744,price:26.99}},pizzas:1,freeToppings:1,includes_fries:true,includes_can:true},
-      "combo deal":{sizes:{12:{id:769,price:29.99},14:{id:770,price:33.99}},pizzas:1,freeToppings:1},
-      "sub combo":{sizes:{8:{id:772,price:11.99},12:{id:774,price:15.99}},includes_fries:true,includes_can:true},
-      "2 sub combo":{sizes:{0:{id:773,price:21.99}}},
-      "3 sub combo":{sizes:{0:{id:780,price:31.99}}},
-      "wings and sub":{sizes:{0:{id:771,price:17.99}},wings:6},
-      "wings special buffalo":{sizes:{0:{id:840,price:9.49}},includes_fries:true,includes_can:true,wings:6},
-      "wings special whole":{sizes:{0:{id:839,price:10.49}},includes_fries:true,includes_can:true,wings:4},
-      "chicken box whole":{sizes:{0:{id:838,price:20.99}}},
-      "chicken box buffalo":{sizes:{0:{id:847,price:25.99}}},
-      "burger combo":{sizes:{0:{id:793,price:7.99}},includes_fries:true,includes_can:true},
-      "fish combo":{sizes:{0:{id:831,price:8.99}},includes_fries:true,includes_can:true},
-      "party deal":{sizes:{0:{id:776,price:84.99}},pizzas:4,freeToppings:1}
-    };
-
-    MENU.loaded = true;
-    console.log("Menu loaded: " + MENU.subs.length + " subs, " + MENU.sandwiches.length + " sandwiches, " + Object.keys(MENU.deals).length + " deals");
-    return true;
-  } catch (e) {
-    console.error("Menu load error:", e);
-    return false;
-  }
-}
-
-// ═══════════════════════════════════════════════════════════════
-// PRICING ENGINE — deterministic, database-driven
-// ═══════════════════════════════════════════════════════════════
-var FREE_TOPPINGS = ["welldone","lite_sauce","extra_sauce","lite_cheese","no_sauce"];
-
-function round2(n) { return Math.round(n * 100) / 100; }
-
-function norm(s) { return (s||"").toLowerCase().replace(/[^a-z0-9]/g,"_").replace(/_+/g,"_").replace(/^_|_$/g,""); }
-
-function matchKeyword(input, list) {
-  var nm = (input || "").toLowerCase().trim();
-  var best = null, bestLen = 0;
-  for (var i = 0; i < list.length; i++) {
-    var keywords = list[i].keywords || [];
-    for (var k = 0; k < keywords.length; k++) {
-      if (nm.indexOf(keywords[k]) !== -1 && keywords[k].length > bestLen) {
-        best = list[i]; bestLen = keywords[k].length;
-      }
-    }
-  }
-  return best;
-}
-
-function pricePizza(size, toppings, freeToppings) {
-  var sz = parseInt(size) || 14;
-  var base = MENU.pizzas[0].prices[sz] || 11.99;
-  var pid = MENU.pizzas[0].ids[sz] || 737;
-  var labels = {10:"Sm",12:"Med",14:"Lrg",16:"XL",18:"XXL"};
-  var mods = [];
-  var topCharge = 0;
-  var chargeCount = 0;
-  var freeCount = freeToppings || 0;
-
-  for (var t = 0; t < (toppings||[]).length; t++) {
-    var top = toppings[t];
-    var tName = (typeof top === "string" ? top : top.name || "").trim();
-    var isHalf = !!(top.half);
-    var n = norm(tName);
-    
-    if (FREE_TOPPINGS.indexOf(n) !== -1) {
-      var tid = (MENU.topping_ids[sz]||{})[n] || null;
-      mods.push({name:tName, modifier_id:tid, group:"Add Toppings", price:0});
-      continue;
-    }
-    
-    chargeCount++;
-    var isFree = chargeCount <= freeCount;
-    var prices = MENU.topping_prices[sz] || MENU.topping_prices[14];
-    var price = 0;
-    if (!isFree) {
-      if (n === "shrimp" || n === "anchovy") price = isHalf ? prices.half : prices[n];
-      else price = isHalf ? prices.half : prices.full;
-    }
-    topCharge += price;
-    
-    var aliases = {jalapeno:"jalapenos",onion:"onions",mushroom:"mushrooms",olive:"black_olives",green_pepper:"green_peppers",sweet_pepper:"sweet_peppers",banana_pepper:"banana_peppers",tomato:"tomatoes",pepper:"green_peppers"};
-    var normalized = aliases[n] || n;
-    var tid = (MENU.topping_ids[sz]||{})[normalized] || null;
-    mods.push({name:isHalf?tName+" (Half)":tName, modifier_id:tid, group:"Add Toppings", price:price, charge:price});
-  }
-
-  return {
-    item_name: sz + " inch " + (labels[sz]||"Lrg") + " Cheese Pizza",
-    item_id: pid, category: "Pizzas",
-    base_price: base, topping_charges: round2(topCharge),
-    unit_price: round2(base + topCharge), modifiers: mods
-  };
-}
-
-function priceSub(subName, size, fixins, cheese, specialInstructions) {
-  var match = matchKeyword(subName, MENU.subs);
-  if (!match) return {error: "Sub not found: " + subName};
-  
-  var isWhole = (size||"").toLowerCase().indexOf("whole") !== -1 || (size||"") === "12";
-  var price = isWhole ? match.p12 : match.p8;
-  var szLabel = isWhole ? "12 inch Whole" : "8 inch Half";
-  
-  var mods = [];
-  for (var f = 0; f < (fixins||[]).length; f++) {
-    var fn = norm(fixins[f]);
-    var aliases = {mayonnaise:"mayo",tomato:"tomatoes",onion:"onions",hot_pepper:"hot_peppers",hots:"hot_peppers",pickle:"pickles",grilled_onion:"grilled_onions",fried_onion:"fried_onions",tartar:"tartar_sauce",tarter:"tartar_sauce",no_hots:"everything_no_hots"};
-    var resolved = aliases[fn] || fn;
-    mods.push({name:fixins[f], modifier_id:MENU.sub_fixins[resolved]||null, group:"Sub Fixins", price:0});
-  }
-  
-  if (cheese) {
-    var cn = norm(cheese);
-    var ca = {mozz:"mozzarella",prov:"provolone",provo:"provolone"};
-    var ck = ca[cn] || cn;
-    mods.push({name:cheese, modifier_id:MENU.cheese_options[ck]||null, group:"Cheese Options", price:0});
-  }
-
-  var result = {
-    item_name: szLabel + " " + match.name,
-    item_id: match.id, category: "Submarines",
-    base_price: price, unit_price: price, modifiers: mods,
-    premium: match.premium
-  };
-  if (specialInstructions) result.special_instructions = specialInstructions;
-  return result;
-}
-
-function priceWings(type, quantity) {
-  var db = type === "whole" ? MENU.whole_wings : MENU.buffalo_wings;
-  var qty = parseInt(quantity) || 0;
-  var match = db.find(function(w) { return w.qty === qty; });
-  if (!match) return {error: (type==="whole"?"Whole":"Buffalo") + " wings not available in " + qty + " pieces. Available: " + db.map(function(w){return w.qty;}).join(", ")};
-  return {
-    item_name: qty + " piece " + (type==="whole"?"Whole":"Buffalo") + " Wings",
-    item_id: match.id, category: "Wings",
-    base_price: match.price, unit_price: match.price, modifiers: []
-  };
-}
-
-function priceGenericItem(itemName) {
-  var allLists = [
-    {list: MENU.sandwiches, cat: "Sandwiches"},
-    {list: MENU.wraps, cat: "Wraps"},
-    {list: MENU.clubs, cat: "Sandwiches"},
-    {list: MENU.salads, cat: "Salads"},
-    {list: MENU.gyros, cat: "Gyro"},
-    {list: MENU.pasta, cat: "Pasta"},
-    {list: MENU.stromboli, cat: "Stromboli"},
-    {list: MENU.quesadillas, cat: "Quesadillas"},
-    {list: MENU.seafood, cat: "Seafood"},
-    {list: MENU.platters, cat: "Seafood"},
-    {list: MENU.sides, cat: "Sides"},
-    {list: MENU.desserts, cat: "Desserts"},
-    {list: MENU.beverages, cat: "Beverages"}
-  ];
-  
-  for (var i = 0; i < allLists.length; i++) {
-    var match = matchKeyword(itemName, allLists[i].list);
-    if (match) {
-      return {
-        item_name: match.name, item_id: match.id,
-        category: allLists[i].cat, unit_price: match.price, modifiers: []
-      };
-    }
-  }
-  return {error: "Item not found: " + itemName};
-}
-
-// ═══════════════════════════════════════════════════════════════
-// DEAL ENGINE — deterministic combo detection
-// ═══════════════════════════════════════════════════════════════
-function checkDeals(basket, declinedDeals) {
-  var pz = [], subs = [], bw = 0, ww = 0, fries = 0, cans = 0, twoL = 0, burger = 0, fish = 0;
-  var PREM_IDS = [723, 724, 725, 726, 710];
-  
-  for (var i = 0; i < basket.length; i++) {
-    var it = basket[i];
-    if (it.is_combo) continue;
-    var nm = (it.item_name || "").toLowerCase();
-    var id = parseInt(it.item_id) || 0;
-    var cat = (it.category || "").toLowerCase();
-    
-    if (cat === "pizzas" && nm.indexOf("cheese pizza") !== -1) {
-      var m = nm.match(/(\d+)\s*inch/);
-      pz.push(m ? parseInt(m[1]) : 14);
-    }
-    if (cat === "submarines") subs.push({sz: nm.indexOf("12 inch") !== -1 ? 12 : 8, id: id, prem: PREM_IDS.indexOf(id) !== -1});
-    if (nm.indexOf("buffalo") !== -1 && cat === "wings") bw += parseInt(nm) || 0;
-    if (nm.indexOf("whole") !== -1 && cat === "wings") ww += parseInt(nm) || 0;
-    if (nm.indexOf("fries") !== -1 || cat === "sides") fries++;
-    if (nm.indexOf("can soda") !== -1) cans++;
-    if (nm.indexOf("2 liter") !== -1) twoL++;
-    if (nm.indexOf("burger sandwich") !== -1 || nm.indexOf("cheeseburger") !== -1) burger++;
-    if (nm.indexOf("fish sandwich") !== -1) fish++;
-  }
-  
-  var reg = subs.filter(function(s) { return !s.prem; });
-  var declined = declinedDeals || [];
-  function no(d) { return declined.indexOf(d) !== -1; }
-  
-  // Exact matches
-  if (pz.length>=4&&bw>=48&&fries&&twoL&&!no("party")) return {match:"party_deal",type:"exact"};
-  if (pz.length>=3&&pz[0]===pz[1]&&pz[1]===pz[2]&&[14,16].indexOf(pz[0])!==-1&&twoL&&!no("3pz")) return {match:"3_pizza",type:"exact"};
-  if (pz.length>=2&&pz[0]===pz[1]&&[12,14,16,18].indexOf(pz[0])!==-1&&!no("dd")) return {match:"double_deal",type:"exact"};
-  if (pz.length>=1&&reg.length>=1&&bw>0&&cans>=2&&!no("combo")) return {match:"combo_deal",type:"exact"};
-  if (pz.length>=1&&bw>0&&twoL>0&&!no("pw")) return {match:"pizza_wings",type:"exact"};
-  if (pz.length>=1&&reg.length>=1&&fries>0&&cans>0&&!no("ps")) return {match:"pizza_sub",type:"exact"};
-  if (reg.length>=1&&bw>=6&&cans>0&&!no("ws")) return {match:"wings_sub",type:"exact"};
-  if (subs.length>=3&&fries>=3&&cans>=3&&!no("3sc")) return {match:"3_sub_combo",type:"exact"};
-  if (subs.length>=2&&fries>=2&&cans>=2&&!no("2sc")) return {match:"2_sub_combo",type:"exact"};
-  if (subs.length>=1&&fries>0&&cans>0&&!no("sc")) return {match:"sub_combo",type:"exact"};
-  if (bw>=12&&cans>=2&&!no("cbb")) return {match:"chicken_box_buffalo",type:"exact"};
-  if (ww>=8&&cans>=2&&!no("cbw")) return {match:"chicken_box_whole",type:"exact"};
-  if (bw===6&&fries&&cans&&!no("wsb")) return {match:"wings_special_buffalo",type:"exact"};
-  if (ww===4&&fries&&cans&&!no("wsw")) return {match:"wings_special_whole",type:"exact"};
-  if (burger&&fries&&cans&&!no("bc")) return {match:"burger_combo",type:"exact"};
-  if (fish&&fries&&cans&&!no("fc")) return {match:"fish_combo",type:"exact"};
-
-  // Near matches
-  if (pz.length>=2&&pz[0]===pz[1]&&!no("dd")) return {match:"near_dd",type:"near",suggestion:"I can make those a double deal. Want that?"};
-  if (pz.length>=1&&bw>0&&!twoL&&!no("pw")) return {match:"near_pw",type:"near",suggestion:"Want a two-liter for the family deal?"};
-  if (pz.length>=1&&reg.length>=1&&(!fries||!cans)&&!no("ps")) return {match:"near_ps",type:"near",suggestion:"Want fries and a soda for the pizza sub combo?"};
-  if (pz.length>=1&&reg.length>=1&&bw>0&&cans<2&&!no("combo")) return {match:"near_combo",type:"near",suggestion:"Add two cans for the combo deal?"};
-  if (subs.length===1&&(!fries||!cans)&&!no("sc")) return {match:"near_sc",type:"near",suggestion:"Want a combo with fries and a soda?"};
-  if (bw===6&&(!fries||!cans)&&!no("wsb")) return {match:"near_wbuf",type:"near",suggestion:"Want fries and a soda for the wings special?"};
-  if (ww===4&&(!fries||!cans)&&!no("wsw")) return {match:"near_wwhole",type:"near",suggestion:"Want fries and a soda for the wings special?"};
-  if (burger&&(!fries||!cans)&&!no("bc")) return {match:"near_bc",type:"near",suggestion:"Want fries and a soda for the burger combo?"};
-  if (fish&&(!fries||!cans)&&!no("fc")) return {match:"near_fc",type:"near",suggestion:"Want fries and a soda for the fish combo?"};
-
-  return {match: "none", type: "none"};
-}
-
-// ═══════════════════════════════════════════════════════════════
-// STATE MACHINE — deterministic transitions
-// ═══════════════════════════════════════════════════════════════
-// States: greeting, collecting, asking_field, suggesting_deal, 
-//         confirming, payment, collecting_card, submitting, done
-
-function processUtterance(session, input) {
-  var intent = (input.intent || "").toLowerCase();
-  var items = input.items || [];
-  var answer = input.answer || "";
-  var utterance = input.utterance || "";
-  var state = session.state;
-  var response = { say: "", action: "continue" };
-
-  // ── GREETING ──
-  if (state === "greeting") {
-    if (intent === "delivery" || utterance.toLowerCase().indexOf("delivery") !== -1) {
-      session.order_type = "delivery";
-      session.state = "collecting_address";
-      response.say = "What's the street address and zip code?";
-      return response;
-    }
-    if (intent === "pickup" || utterance.toLowerCase().indexOf("pickup") !== -1 || utterance.toLowerCase().indexOf("pick up") !== -1) {
-      session.order_type = "pickup";
-    }
-    // If they ordered items at greeting, process them
-    if (items.length > 0) {
-      session.order_type = session.order_type || "pickup";
-      session.state = "collecting";
-      return processItems(session, items, response);
-    }
-    session.state = "collecting";
-    response.say = "What can I get for you?";
-    return response;
-  }
-
-  // ── COLLECTING ADDRESS ──
-  if (state === "collecting_address") {
-    if (input.delivery_address && input.delivery_zip) {
-      session.delivery_address = input.delivery_address;
-      session.delivery_zip = input.delivery_zip;
-      session.state = "collecting";
-      response.say = "Got it. What can I get for you?";
-      // TODO: verify address via tool in production
-      return response;
-    }
-    if (intent === "pickup") {
-      session.order_type = "pickup";
-      session.state = "collecting";
-      response.say = "Got it, pickup. What can I get for you?";
-      return response;
-    }
-    response.say = "I need the street address and zip code for delivery.";
-    return response;
-  }
-
-  // ── COLLECTING ITEMS ──
-  if (state === "collecting" || state === "asking_field") {
-    // Handle answer to a pending question
-    if (state === "asking_field" && session.current_item && session.missing_fields.length > 0) {
-      var field = session.missing_fields[0];
-      if (answer || utterance) {
-        var val = answer || utterance.trim();
-        session.current_item[field] = val;
-        session.missing_fields.shift();
-        
-        // More fields needed?
-        if (session.missing_fields.length > 0) {
-          response.say = getFieldQuestion(session.missing_fields[0], session.current_item);
-          return response;
-        }
-        
-        // All fields collected — price it
-        var priced = priceItem(session.current_item);
-        if (priced.error) {
-          response.say = priced.error;
-          session.state = "collecting";
-          session.current_item = null;
-          return response;
-        }
-        session.basket.push(priced);
-        session.current_item = null;
-        session.state = "collecting";
-        
-        // Check deals
-        var deal = checkDeals(session.basket, session.declined_deals);
-        if (deal.type === "near" && session.suggested_deals.indexOf(deal.match) === -1) {
-          session.suggested_deals.push(deal.match);
-          session.pending_deal = deal;
-          session.state = "suggesting_deal";
-          response.say = "Got it. " + deal.suggestion;
-          return response;
-        }
-        if (deal.type === "exact") {
-          session.pending_deal = deal;
-          session.state = "suggesting_deal";
-          response.say = "Got it. I can make that a " + deal.match.replace(/_/g, " ") + ". Want that?";
-          return response;
-        }
-        
-        response.say = "Got it. Anything else?";
-        return response;
-      }
-    }
-
-    // Customer says done
-    if (intent === "done_ordering" || intent === "confirm" || 
-        utterance.toLowerCase().match(/\b(that'?s it|that'?s all|nothing else|no|nope|i'?m done|place.*(order|it))\b/)) {
-      // Process any pending items first
-      if (items.length > 0) {
-        var r = processItems(session, items, response);
-        // After processing, go to confirm
-        session.state = "confirming";
-        return r;
-      }
-      if (session.basket.length === 0) {
-        response.say = "You haven't ordered anything yet. What can I get for you?";
-        return response;
-      }
-      session.state = "confirming";
-      return buildConfirmation(session, response);
-    }
-
-    // Customer asks about specials
-    if (intent === "ask_specials") {
-      response.say = "We have the double deal, family deal with pizza and wings, sub combo, wings special, and more. What can I get for you?";
-      return response;
-    }
-
-    // New items to process
-    if (items.length > 0) {
-      return processItems(session, items, response);
-    }
-
-    // Deal by name
-    if (intent === "order_deal" && input.deal_name) {
-      response.say = "Let me set up the " + input.deal_name + ". What size pizza?";
-      session.state = "collecting_deal";
-      session.current_deal = input.deal_name.toLowerCase();
-      return response;
-    }
-
-    response.say = "What can I get for you?";
-    return response;
-  }
-
-  // ── SUGGESTING DEAL ──
-  if (state === "suggesting_deal") {
-    if (intent === "confirm" || utterance.toLowerCase().match(/\b(yes|yeah|sure|ok|yep)\b/)) {
-      // Customer accepted deal — need to collect remaining deal fields
-      // For now, route to deal collection
-      session.state = "collecting_deal";
-      session.current_deal = session.pending_deal.match;
-      response.say = "What flavor soda?";
-      return response;
-    }
-    if (intent === "deny" || utterance.toLowerCase().match(/\b(no|nah|nope)\b/)) {
-      if (session.pending_deal) {
-        session.declined_deals.push(session.pending_deal.match);
-      }
-      session.pending_deal = null;
-      session.state = "collecting";
-      
-      // Check if they also mentioned new items
-      if (items.length > 0) {
-        return processItems(session, items, response);
-      }
-      response.say = "No problem. Anything else?";
-      return response;
-    }
-    // They might be ordering more instead
-    if (items.length > 0) {
-      session.pending_deal = null;
-      session.state = "collecting";
-      return processItems(session, items, response);
-    }
-    response.say = "Would you like to add that deal?";
-    return response;
-  }
-
-  // ── CONFIRMING ORDER ──
-  if (state === "confirming") {
-    if (intent === "confirm" || utterance.toLowerCase().match(/\b(yes|yeah|ok|sounds good|correct|yep|place it)\b/)) {
-      session.state = "payment";
-      if (session.order_type === "pickup") {
-        response.say = "You'll pay at the counter when you pick up.";
-        session.payment_method = "cash";
-        session.state = "submitting";
-        return response;
-      }
-      response.say = "Will that be cash or card?";
-      return response;
-    }
-    if (intent === "deny" || intent === "modify") {
-      session.state = "collecting";
-      response.say = "What would you like to change?";
-      return response;
-    }
-    if (items.length > 0) {
-      session.state = "collecting";
-      return processItems(session, items, response);
-    }
-    return buildConfirmation(session, response);
-  }
-
-  // ── PAYMENT ──
-  if (state === "payment") {
-    if (intent === "pay_cash" || utterance.toLowerCase().indexOf("cash") !== -1) {
-      session.payment_method = "cash";
-      session.state = "submitting";
-      response.say = "Got it, cash.";
-      return response;
-    }
-    if (intent === "pay_card" || utterance.toLowerCase().indexOf("card") !== -1) {
-      session.state = "collecting_card";
-      response.say = "What's the card number?";
-      return response;
-    }
-    response.say = "Will that be cash or card?";
-    return response;
-  }
-
-  // ── SUBMITTING ──
-  if (state === "submitting") {
-    if (!session.customer_name && input.customer_name) {
-      session.customer_name = input.customer_name;
-    }
-    if (!session.customer_phone && input.customer_phone) {
-      session.customer_phone = input.customer_phone;
-    }
-    
-    if (!session.customer_phone) {
-      response.say = "What's a good phone number for the order?";
-      response.need = "phone";
-      return response;
-    }
-    if (!session.customer_name) {
-      response.say = "And what name for the order?";
-      response.need = "name";
-      return response;
-    }
-    
-    // Ready to submit
-    response.action = "submit";
-    response.order = buildOrderPayload(session);
-    response.say = "Placing the order now.";
-    return response;
-  }
-
-  // Fallback
-  response.say = "I'm sorry, could you repeat that?";
-  return response;
-}
-
-// ── Process multiple items from one utterance ──
-function processItems(session, items, response) {
-  var messages = [];
-  
-  for (var i = 0; i < items.length; i++) {
-    var item = items[i];
-    var missing = getMissingFields(item);
-    
-    if (missing.length > 0) {
-      // Store as current item, ask for first missing field
-      session.current_item = item;
-      session.missing_fields = missing;
-      session.state = "asking_field";
-      
-      if (messages.length > 0) {
-        response.say = messages.join(" ") + " " + getFieldQuestion(missing[0], item);
-      } else {
-        response.say = getFieldQuestion(missing[0], item);
-      }
-      
-      // Queue remaining items
-      if (i + 1 < items.length) {
-        session.pending_items = items.slice(i + 1);
-      }
-      return response;
-    }
-    
-    // All fields present — price it
-    var priced = priceItem(item);
-    if (priced.error) {
-      messages.push(priced.error);
-      continue;
-    }
-    session.basket.push(priced);
-    messages.push("Got it.");
-  }
-  
-  // All items processed — check deals
-  var deal = checkDeals(session.basket, session.declined_deals);
-  if (deal.type === "near" && session.suggested_deals.indexOf(deal.match) === -1) {
-    session.suggested_deals.push(deal.match);
-    session.pending_deal = deal;
-    session.state = "suggesting_deal";
-    response.say = (messages.length > 0 ? messages.join(" ") + " " : "") + deal.suggestion;
-    return response;
-  }
-  if (deal.type === "exact") {
-    session.pending_deal = deal;
-    session.state = "suggesting_deal";
-    response.say = (messages.length > 0 ? messages.join(" ") + " " : "") + "I can make that a " + deal.match.replace(/_/g, " ") + ". Want that?";
-    return response;
-  }
-  
-  response.say = (messages.length > 0 ? messages.join(" ") + " " : "") + "Anything else?";
-  return response;
-}
-
-// ── Determine missing required fields ──
-function getMissingFields(item) {
-  var type = (item.item_type || "").toLowerCase();
-  var missing = [];
-  
-  if (type === "pizza") {
-    if (!item.size) missing.push("size");
-    // toppings are optional (can be just cheese)
-  }
-  else if (type === "sub") {
-    if (!item.name && !item.sub_name) missing.push("name");
-    // fixins required
-    if (!item.fixins || item.fixins.length === 0) missing.push("fixins");
-    if (!item.cheese) missing.push("cheese");
-  }
-  else if (type === "buffalo_wings") {
-    if (!item.quantity) missing.push("quantity");
-    if (!item.flavor) missing.push("flavor");
-    if (!item.dressing) missing.push("dressing");
-  }
-  else if (type === "whole_wings") {
-    if (!item.quantity) missing.push("quantity");
-  }
-  else if (type === "salad") {
-    if (!item.dressing) missing.push("dressing");
-  }
-  else if (type === "gyro") {
-    if (!item.name) missing.push("meat_type");
-  }
-  else if (type === "drink" && (!item.soda_flavor && (item.name||"").toLowerCase().indexOf("soda") !== -1)) {
-    missing.push("soda_flavor");
-  }
-  
-  return missing;
-}
-
-// ── Generate question for a missing field ──
-function getFieldQuestion(field, item) {
-  var type = (item.item_type || "").toLowerCase();
-  switch (field) {
-    case "size": return "What size — small, medium, large, or x-large?";
-    case "name": return type === "sub" ? "Which sub would you like?" : "Which one?";
-    case "fixins": return "What do you want on it?";
-    case "cheese": return "What cheese — American, provolone, or mozzarella?";
-    case "flavor": return "What flavor?";
-    case "dressing": return type === "salad" ? "What dressing?" : "Ranch or blue cheese?";
-    case "quantity": return "How many pieces?";
-    case "meat_type": return "Chicken or lamb?";
-    case "soda_flavor": return "What flavor soda?";
-    default: return "What would you like for " + field + "?";
-  }
-}
-
-// ── Price any item based on type ──
-function priceItem(item) {
-  var type = (item.item_type || "").toLowerCase();
-  
-  if (type === "pizza") {
-    return pricePizza(item.size, item.toppings, 0);
-  }
-  if (type === "sub") {
-    return priceSub(item.name || item.sub_name, item.size || "half", item.fixins, item.cheese, item.special_instructions);
-  }
-  if (type === "buffalo_wings") {
-    var result = priceWings("buffalo", item.quantity);
-    if (!result.error) {
-      if (item.flavor) {
-        var fn = norm(item.flavor);
-        result.modifiers.push({name:item.flavor, modifier_id:MENU.wing_flavors[fn]||null, group:"Wings - Flavors", price:0});
-      }
-      if (item.dressing) {
-        var dn = norm(item.dressing);
-        result.modifiers.push({name:item.dressing, modifier_id:MENU.wing_dressings[dn]||null, group:"Wings - Dressing", price:0});
-      }
-    }
-    return result;
-  }
-  if (type === "whole_wings") {
-    return priceWings("whole", item.quantity);
-  }
-  if (type === "sandwich" || type === "wrap" || type === "club") {
-    return priceGenericItem(item.name);
-  }
-  if (type === "salad") {
-    var r = priceGenericItem(item.name);
-    if (!r.error && item.dressing) {
-      var dn = norm(item.dressing);
-      r.modifiers = r.modifiers || [];
-      r.modifiers.push({name:item.dressing, modifier_id:MENU.salad_dressings[dn]||null, group:"Salad Dressing", price:0});
-    }
-    return r;
-  }
-  if (type === "drink") {
-    var r = priceGenericItem(item.name || "can soda");
-    if (!r.error && item.soda_flavor) {
-      var sn = norm(item.soda_flavor);
-      r.modifiers = r.modifiers || [];
-      r.modifiers.push({name:item.soda_flavor, modifier_id:MENU.soda_flavors[sn]||null, group:"Soda Can", price:0});
-    }
-    return r;
-  }
-  
-  // Generic fallback
-  return priceGenericItem(item.name || "");
-}
-
-// ── Build order confirmation text ──
-function buildConfirmation(session, response) {
-  var subtotal = 0;
-  var lines = [];
-  
-  for (var i = 0; i < session.basket.length; i++) {
-    var it = session.basket[i];
-    var price = parseFloat(it.unit_price) || 0;
-    subtotal += price;
-    lines.push(it.item_name + " for " + formatPrice(price));
-  }
-  
-  subtotal = round2(subtotal);
-  var tax = round2(subtotal * 0.06);
-  var fee = session.order_type === "delivery" ? 2.00 : 0;
-  var total = round2(subtotal + tax + fee);
-  
-  session.subtotal = subtotal;
-  session.tax = tax;
-  session.delivery_fee = fee;
-  session.total = total;
-  
-  var say = "Let me read that back. " + lines.join(", ") + ". ";
-  say += "Subtotal is " + formatPrice(subtotal) + ", tax is " + formatPrice(tax);
-  if (fee > 0) say += ", delivery fee is " + formatPrice(fee);
-  say += ", total is " + formatPrice(total) + ". Does that sound good?";
-  
-  response.say = say;
-  return response;
-}
-
-function formatPrice(n) {
-  var d = n.toFixed(2).split(".");
-  var dollars = parseInt(d[0]);
-  var cents = parseInt(d[1]);
-  if (cents === 0) return dollars + " dollars";
-  return dollars + " " + cents;
-}
-
-// ── Build POS order payload ──
-function buildOrderPayload(session) {
-  return {
-    order_type: session.order_type,
-    customer_name: session.customer_name,
-    customer_phone: session.customer_phone,
-    delivery_address: session.order_type === "delivery" ? session.delivery_address : undefined,
-    payment_method: session.payment_method,
-    payment_ref: session.payment_ref || undefined,
-    items: session.basket.map(function(it) {
-      return {
-        item_name: it.item_name,
-        item_id: String(it.item_id),
-        unit_price: it.unit_price,
-        quantity: it.quantity || 1,
-        is_combo: !!it.is_combo,
-        modifiers: it.modifiers || [],
-        components: it.components || [],
-        special_instructions: it.special_instructions || undefined
-      };
-    }),
-    subtotal: session.subtotal,
-    tax: session.tax,
-    delivery_fee: session.delivery_fee,
-    total: session.total
-  };
-}
-
-// ═══════════════════════════════════════════════════════════════
-// MAIN ENDPOINT — called by Retell after every utterance
-// ═══════════════════════════════════════════════════════════════
-app.post("/retell/function/process_utterance", function (req, res) {
-  var data = req.body.args || req.body;
-  var callObj = req.body.call || {};
-  var callId = callObj.call_id || data.session_id || "unknown_" + Date.now();
-  
-  var session = getSession(callId);
-  
-  console.log("\n=== UTTERANCE [" + session.state + "] ===");
-  console.log("  Intent:", data.intent);
-  console.log("  Utterance:", (data.utterance || "").substring(0, 100));
-  console.log("  Items:", (data.items || []).length);
-  console.log("  Basket:", session.basket.length, "items");
-  
-  var result = processUtterance(session, data);
-  
-  console.log("  → State:", session.state);
-  console.log("  → Say:", (result.say || "").substring(0, 100));
-  console.log("  → Basket:", session.basket.length, "items, $" + session.basket.reduce(function(s,i){return s+(i.unit_price||0);},0).toFixed(2));
-  
-  if (result.action === "submit" && result.order) {
-    // Auto-submit to POS
-    var built = buildXml(result.order);
-    console.log("  → Submitting to POS, ref:", built.ref);
-    sendToPOS(built.xml).then(function(posResult) {
-      console.log("  → POS result:", posResult.ok ? "OK" : "FAIL");
-    }).catch(function(e) {
-      console.error("  → POS error:", e.message);
     });
-    
-    res.json({
-      say: "Your order is placed, reference number " + built.ref + ". " + (session.order_type === "pickup" ? "Pickup fifteen to twenty minutes." : "Delivery thirty to forty-five minutes.") + " Thanks for calling!",
-      action: "end_call",
-      ref: built.ref
-    });
-    return;
+    console.log("DB: Rebuilt topping prices for " + MENU_CACHE.toppings.length + " toppings");
   }
   
-  res.json(result);
-});
+  // Rebuild COMBO_DB from database
+  if (MENU_CACHE.combo_deals.length > 0) {
+    COMBO_DB = {};
+    MENU_CACHE.combo_deals.forEach(function(d) {
+      var dt = d.deal_type;
+      if (!COMBO_DB[dt]) {
+        COMBO_DB[dt] = {sizes:{}, desc: d.description, pizzas: d.pizza_count, freeToppings: d.free_toppings};
+      }
+      var sk = d.pizza_size || 0;
+      COMBO_DB[dt].sizes[sk] = {id: d.deal_pos_id, price: parseFloat(d.price)};
+      if (d.includes_fries) COMBO_DB[dt].includes_fries = true;
+      if (d.includes_can) COMBO_DB[dt].includes_can = true;
+      if (d.includes_2l) COMBO_DB[dt].includes_2l = true;
+      if (d.wing_count > 0) COMBO_DB[dt].wings = d.wing_count;
+    });
+    console.log("DB: Rebuilt COMBO_DB with " + Object.keys(COMBO_DB).length + " deal types");
+  }
+  
+  // Rebuild FIXED_ITEMS from database (non-sub, non-pizza items)
+  var fixable = MENU_CACHE.items.filter(function(i) { return i.item_type !== "sub" && i.item_type !== "cheese_pizza" && i.item_type !== "specialty_pizza"; });
+  if (fixable.length > 0) {
+    FIXED_ITEMS = {};
+    fixable.forEach(function(i) {
+      (i.keywords || []).forEach(function(kw) {
+        FIXED_ITEMS[kw] = i.pos_id;
+      });
+    });
+    console.log("DB: Rebuilt FIXED_ITEMS with " + Object.keys(FIXED_ITEMS).length + " keywords");
+  }
+  
+  // Rebuild SUB_FIXINS_IDS and prices
+  if (MENU_CACHE.sub_fixins.length > 0) {
+    SUB_FIXINS_IDS = {};
+    SUB_FIXINS_PRICES = {};
+    MENU_CACHE.sub_fixins.forEach(function(f) {
+      var norm = normTopping(f.fixin_name);
+      SUB_FIXINS_IDS[norm] = f.modifier_id;
+      if (parseFloat(f.price) > 0) SUB_FIXINS_PRICES[norm] = parseFloat(f.price);
+    });
+  }
+  
+  // Rebuild CHEESE_IDS and prices
+  if (MENU_CACHE.cheese_options.length > 0) {
+    CHEESE_IDS = {};
+    CHEESE_PRICES = {};
+    MENU_CACHE.cheese_options.forEach(function(c) {
+      var norm = normTopping(c.cheese_name);
+      CHEESE_IDS[norm] = c.modifier_id;
+      if (parseFloat(c.price) > 0) CHEESE_PRICES[norm] = parseFloat(c.price);
+    });
+  }
+}
 
+// Load menu on startup
+if (pool) {
+  loadMenuFromDB().then(function(ok) {
+    if (!ok) console.log("DB: Using hardcoded defaults as fallback");
+  });
+}
 
-// ═══════════════════════════════════════════════════════════════
-// POS INTEGRATION — Full XML builder, payment, address, caller ID
-// Merged from server_v18.js — production-tested
-// ═══════════════════════════════════════════════════════════════
+// Tag constants — built via concatenation to prevent any stripping
+var NT = "<" + "na" + "me" + ">";
+var NTC = "</" + "na" + "me" + ">";
 
 var CONFIG = {
   RESTAURANT_ID: process.env.RESTAURANT_ID || "80001",
@@ -1446,7 +229,6 @@ function X(s) {
 // ITEM ID AUTO-CORRECTION — fixes wrong IDs from agent
 // Maps item_name to correct POS foodMenuItemId
 // ═══════════════════════════════════════════════════
-
 
 var SIZED_ITEMS = {
   // Cheese Pizzas: keyword → {size: id}
@@ -1712,7 +494,6 @@ function extractNumber(str) {
   return m ? parseInt(m[1]) : 0;
 }
 
-
 function fixItemId(item) {
   var nm = (item.item_name || item.component_name || item.name || "").toLowerCase()
     .replace(/[""\-]/g, " ").replace(/\s+/g, " ").trim();
@@ -1789,7 +570,12 @@ function fixAllIds(order) {
   }
 }
 
+// Kitchen printer routing — explicit item IDs
+// Kitchen 2 (printKitchen2): Pizzas and Stromboli
+// Kitchen 1 (printKitchen): Everything else
+// Tags are OMITTED (not set to N) for the printer that doesn't apply
 
+// All Kitchen 2 item IDs:
 var KITCHEN2_IDS = {
   // Cheese Pizzas
   735:1, 736:1, 737:1, 738:1, 739:1,
@@ -1926,7 +712,6 @@ function buildComboItems(item) {
   return o;
 }
 
-
 function buildXml(order) {
   var ref = genRef();
   var sub = parseFloat(order.subtotal || 0);
@@ -2011,8 +796,7 @@ var orderLog = [];
 
 // ═══════════════════════════════════════════════════
 // ROUTE: Get caller ID (returns phone number to agent)
-
-
+// ═══════════════════════════════════════════════════
 app.post("/retell/function/get_caller_id", function (req, res) {
   var callObj = req.body.call || {};
   var phone = callObj.from_number || callObj.caller_number || callObj.user_phone || "";
@@ -2090,96 +874,6 @@ app.post("/retell/function/submit_order", async function (req, res) {
     log.order_type = data.order_type || "?";
     log.total = data.total || 0;
 
-    // ═══ SERVER-SIDE VALIDATION — reject fabricated data ═══
-    var VALID_DEAL_IDS = {769:1,770:1,771:1,772:1,773:1,774:1,775:1,776:1,777:1,778:1,780:1,781:1,782:1,783:1,784:1,786:1,787:1,788:1,793:1,794:1,831:1,838:1,839:1,840:1,744:1,847:1};
-    var validationErrors = [];
-
-    if (data.items && data.items.length > 0) {
-      for (var v = 0; v < data.items.length; v++) {
-        var vi = data.items[v];
-        var vid = String(vi.item_id || "");
-        var vname = (vi.item_name || "").toLowerCase();
-        var vprice = parseFloat(vi.unit_price || 0);
-
-        // 1. Reject made-up item IDs (non-numeric or clearly fake like 1001, 1002, 1003)
-        if (vid && !/^\d+$/.test(vid)) {
-          validationErrors.push("Item '" + vi.item_name + "' has non-numeric ID: " + vid);
-        }
-        if (parseInt(vid) >= 1000 && parseInt(vid) <= 1099 && !VALID_DEAL_IDS[parseInt(vid)]) {
-          validationErrors.push("Item '" + vi.item_name + "' has fabricated ID: " + vid + ". Use calculate_price or calculate_combo to get the correct ID.");
-        }
-
-        // 2. Combo items MUST have been through calculate_combo (valid deal_id)
-        if (vi.is_combo) {
-          if (!vid || !VALID_DEAL_IDS[parseInt(vid)]) {
-            // Try to fix from DEAL_IDS map
-            var dealFix = null;
-            for (var dk in DEAL_IDS) {
-              if (vname.indexOf(dk) !== -1) { dealFix = DEAL_IDS[dk]; break; }
-            }
-            if (dealFix) {
-              // Try to find the right size-specific ID
-              var sizeMatch = vname.match(/(\d+)\s*inch/);
-              var dealSize = sizeMatch ? parseInt(sizeMatch[1]) : 0;
-              if (typeof dealFix === "object" && dealFix[dealSize]) {
-                vi.item_id = String(dealFix[dealSize]);
-                console.log("VALIDATE-FIX: " + vname + " ID " + vid + " → " + vi.item_id);
-              } else if (typeof dealFix === "object" && dealFix[0]) {
-                vi.item_id = String(dealFix[0]);
-                console.log("VALIDATE-FIX: " + vname + " ID " + vid + " → " + vi.item_id);
-              } else if (typeof dealFix === "number") {
-                vi.item_id = String(dealFix);
-                console.log("VALIDATE-FIX: " + vname + " ID " + vid + " → " + vi.item_id);
-              } else {
-                validationErrors.push("Combo '" + vi.item_name + "' has invalid deal ID: " + vid + ". Call calculate_combo first.");
-              }
-            } else {
-              validationErrors.push("Combo '" + vi.item_name + "' has invalid deal ID: " + vid + ". Call calculate_combo first.");
-            }
-          }
-
-          // 3. Combo price validation — check against known deal prices
-          var comboDB = COMBO_DB || {};
-          for (var cdk in comboDB) {
-            if (vname.indexOf(cdk) !== -1 || (comboDB[cdk].desc && vname.indexOf(cdk.replace(/ /g,"")) !== -1)) {
-              var cdeal = comboDB[cdk];
-              if (cdeal.sizes) {
-                var sizeMatch2 = vname.match(/(\d+)\s*inch/);
-                var ds = sizeMatch2 ? parseInt(sizeMatch2[1]) : 0;
-                var dse = cdeal.sizes[ds] || cdeal.sizes[0];
-                if (dse && vprice < dse.price) {
-                  validationErrors.push("Combo '" + vi.item_name + "' price " + vprice + " is below base price " + dse.price + ". Call calculate_combo for correct pricing.");
-                }
-              }
-              break;
-            }
-          }
-        }
-
-        // 4. Regular item price validation — $0 items are suspicious
-        if (!vi.is_combo && vprice <= 0 && vname.indexOf("fries") === -1 && vname.indexOf("soda") === -1) {
-          validationErrors.push("Item '" + vi.item_name + "' has $0 price. Call calculate_price first.");
-        }
-
-        // 5. Check for missing customer name
-        if (!data.customer_name || data.customer_name === "?" || data.customer_name.toLowerCase() === "customer") {
-          if (validationErrors.indexOf("Missing customer name. Ask the caller for their name.") === -1) {
-            validationErrors.push("Missing customer name. Ask the caller for their name.");
-          }
-        }
-      }
-    }
-
-    // Return errors to agent — force it to use tools
-    if (validationErrors.length > 0) {
-      console.log("VALIDATION FAILED:", validationErrors);
-      log.status = "VALIDATION_FAILED";
-      log.validation_errors = validationErrors;
-      orderLog.unshift(log); if (orderLog.length > 50) orderLog.pop();
-      return res.json("ERROR: Order rejected. " + validationErrors.join(" | ") + " Fix these issues and try again.");
-    }
-    // ═══ END VALIDATION ═══
-
     console.log("\n=== RETELL ORDER ===");
     console.log("Caller Phone (auto):", callerPhone);
     console.log("Items:", itemSummary.length);
@@ -2202,8 +896,7 @@ app.post("/retell/function/submit_order", async function (req, res) {
 
 // ═══════════════════════════════════════════════════
 // ROUTE: Process card payment (USAePay REST API)
-
-
+// ═══════════════════════════════════════════════════
 var crypto = require("crypto");
 
 function usaepayAuth() {
@@ -2352,7 +1045,6 @@ app.get("/test-payment", async function (req, res) {
   } catch (e) { res.json({ error: e.message }); }
 });
 
-
 app.post("/retell/function/verify_address", async function (req, res) {
   try {
     var data = req.body.args || req.body;
@@ -2424,448 +1116,6 @@ app.post("/retell/function/verify_address", async function (req, res) {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════
-// ROUTE: calculate_price — deterministic item pricing
-// Agent calls this for EVERY individual menu item
-// ═══════════════════════════════════════════════════════════════
-
-app.post("/retell/function/calculate_price", function (req, res) {
-  try {
-    var data = req.body.args || req.body;
-    console.log("\n=== CALCULATE PRICE ===");
-    console.log(JSON.stringify(data));
-
-    var type = (data.item_type || "").toLowerCase();
-    var result = null;
-
-    if (type === "pizza") {
-      result = pricePizza(data.size, data.toppings, 0);
-    } else if (type === "specialty pizza" || type === "specialty") {
-      var specMatch = matchKeyword(data.pizza_name || data.item_name || "", MENU.specialty);
-      if (!specMatch) return res.json({ error: "Specialty pizza not found: " + (data.pizza_name || data.item_name) });
-      var sz = parseInt(data.size) || 14;
-      var labels = {10:"Sm",12:"Med",14:"Lrg",16:"XL",18:"XXL"};
-      result = {
-        item_name: sz + " inch " + (labels[sz]||"Lrg") + " " + specMatch.name + " Pizza",
-        item_id: specMatch.id, category: "Pizzas",
-        unit_price: specMatch.prices[sz] || specMatch.prices[14],
-        modifiers: []
-      };
-    } else if (type === "sub") {
-      result = priceSub(data.sub_name || data.item_name || "", data.sub_size || "half", data.fixins, data.cheese, data.special_instructions);
-    } else if (type === "wings" || type === "buffalo wings" || type === "buffalo_wings") {
-      result = priceWings("buffalo", data.quantity);
-      if (!result.error) {
-        if (data.wing_flavor) {
-          var fn = norm(data.wing_flavor);
-          result.modifiers.push({name:data.wing_flavor, modifier_id:MENU.wing_flavors[fn]||null, group:"Wings - Flavors", price:0});
-        }
-        if (data.wing_dressing) {
-          var dn = norm(data.wing_dressing);
-          result.modifiers.push({name:data.wing_dressing, modifier_id:MENU.wing_dressings[dn]||null, group:"Wings - Dressing", price:0});
-        }
-      }
-    } else if (type === "whole wings" || type === "whole_wings") {
-      result = priceWings("whole", data.quantity);
-    } else if (type === "salad") {
-      result = priceGenericItem(data.item_name || "");
-      if (!result.error && data.salad_dressing) {
-        var sdn = norm(data.salad_dressing);
-        result.modifiers = result.modifiers || [];
-        result.modifiers.push({name:data.salad_dressing, modifier_id:MENU.salad_dressings[sdn]||null, group:"Salad Dressing", price:0});
-      }
-    } else if (type === "gyro") {
-      var gyroName = (data.gyro_meat || "chicken").toLowerCase() + " gyro";
-      if ((data.item_name || "").toLowerCase().indexOf("platter") !== -1) gyroName += " platter";
-      result = priceGenericItem(gyroName);
-    } else if (type === "drink" || type === "soda" || type === "beverage") {
-      result = priceGenericItem(data.item_name || "can soda");
-      if (!result.error && data.soda_flavor) {
-        var sfn = norm(data.soda_flavor);
-        result.modifiers = result.modifiers || [];
-        result.modifiers.push({name:data.soda_flavor, modifier_id:MENU.soda_flavors[sfn]||null, group:"Soda Can", price:0});
-      }
-    } else if (type === "tenders" || type === "chicken tenders") {
-      var tMatch = MENU.tenders.find(function(t) { return t.qty === (parseInt(data.quantity) || 0); });
-      if (!tMatch) return res.json({ error: "Tenders not available in " + data.quantity + "pc. Available: 3, 5, 7." });
-      result = { item_name: tMatch.qty + " piece Chicken Tenders", item_id: tMatch.id, category: "Tenders", unit_price: tMatch.price, modifiers: [] };
-      if (data.tender_sauce) {
-        var tsn = norm(data.tender_sauce);
-        result.modifiers.push({name:data.tender_sauce, modifier_id:MENU.tender_sauces[tsn]||null, group:"Tender Sauce", price:0});
-      }
-    } else {
-      result = priceGenericItem(data.item_name || data.sub_name || "");
-    }
-
-    if (result && result.error) return res.json(result);
-    if (!result) return res.json({ error: "Could not price item type: " + type });
-
-    // Add special instructions if present
-    if (data.special_instructions) result.special_instructions = data.special_instructions;
-
-    console.log("  → " + result.item_name + " $" + result.unit_price);
-    res.json(result);
-  } catch (e) {
-    console.error("calculate_price error:", e);
-    res.json({ error: "Pricing error: " + e.message });
-  }
-});
-
-
-// ═══════════════════════════════════════════════════════════════
-// ROUTE: calculate_combo — deterministic combo deal pricing
-// Agent calls this for EVERY combo deal
-// ═══════════════════════════════════════════════════════════════
-
-app.post("/retell/function/calculate_combo", function (req, res) {
-  try {
-    var data = req.body.args || req.body;
-    console.log("\n=== CALCULATE COMBO ===");
-    console.log(JSON.stringify(data));
-
-    var dealType = (data.deal_type || "").toLowerCase().trim();
-    var deal = MENU.deals[dealType];
-    if (!deal) {
-      // Try fuzzy match
-      for (var dk in MENU.deals) {
-        if (dealType.indexOf(dk) !== -1 || dk.indexOf(dealType) !== -1) {
-          deal = MENU.deals[dk]; dealType = dk; break;
-        }
-      }
-    }
-    if (!deal) return res.json({ error: "Deal not found: " + data.deal_type + ". Available: " + Object.keys(MENU.deals).join(", ") });
-
-    var pizzaSize = parseInt(data.pizza_size) || 14;
-    var subSize = (data.sub_size || "half").toLowerCase().indexOf("whole") !== -1 ? 12 : 8;
-
-    // Find deal ID and base price
-    var sizeKey = deal.sizes[pizzaSize] ? pizzaSize : (deal.sizes[subSize] ? subSize : (deal.sizes[0] ? 0 : Object.keys(deal.sizes)[0]));
-    var dealEntry = deal.sizes[sizeKey];
-    if (!dealEntry) return res.json({ error: "Deal '" + dealType + "' not available in size " + pizzaSize + ". Available: " + Object.keys(deal.sizes).join(", ") });
-
-    var basePrice = dealEntry.price;
-    var dealId = dealEntry.id;
-    var extraCharges = 0;
-    var labels = {10:"Sm",12:"Med",14:"Lrg",16:"XL",18:"XXL"};
-
-    // Calculate extra topping charges beyond free toppings
-    var freeToppings = deal.freeToppings || 0;
-    var pizzas = data.pizzas || [];
-    for (var pi = 0; pi < pizzas.length; pi++) {
-      var pToppings = pizzas[pi].toppings || [];
-      var chargeCount = 0;
-      for (var ti = 0; ti < pToppings.length; ti++) {
-        var tName = norm(typeof pToppings[ti] === "string" ? pToppings[ti] : pToppings[ti].name || "");
-        if (FREE_TOPPINGS.indexOf(tName) !== -1) continue;
-        chargeCount++;
-        if (chargeCount > freeToppings) {
-          var isHalf = !!(pToppings[ti].half);
-          var prices = MENU.topping_prices[pizzaSize] || MENU.topping_prices[14];
-          var charge = (tName === "shrimp" || tName === "anchovy") ? (isHalf ? prices.half : prices[tName]) : (isHalf ? prices.half : prices.full);
-          extraCharges += charge;
-        }
-      }
-    }
-
-    // Fries upgrade
-    if (data.fries_upgrade) {
-      var friesMatch = matchKeyword(data.fries_upgrade, MENU.sides);
-      if (friesMatch && friesMatch.price > 2.99) {
-        extraCharges += 2.00; // $2 upgrade fee
-      }
-    }
-
-    var totalPrice = round2(basePrice + extraCharges);
-    var dealName = dealType.split(" ").map(function(w) { return w.charAt(0).toUpperCase() + w.slice(1); }).join(" ");
-    if (pizzaSize && deal.pizzas) dealName = pizzaSize + " inch " + dealName;
-
-    // Check premium sub restriction
-    if (data.sub_name) {
-      var subMatch = matchKeyword(data.sub_name, MENU.subs);
-      if (subMatch && subMatch.premium) {
-        var premExcluded = ["pizza and sub", "pizza sub combo", "combo deal", "wings and sub"];
-        if (premExcluded.indexOf(dealType) !== -1) {
-          return res.json({ error: subMatch.name + " is a premium sub and not allowed in " + dealType + ". Try a sub combo instead, or choose a regular sub." });
-        }
-      }
-    }
-
-    var result = {
-      deal_type: dealType,
-      item_name: dealName,
-      deal_id: String(dealId),
-      unit_price: totalPrice,
-      base_price: basePrice,
-      extra_topping_charges: round2(extraCharges),
-      category: "Combo",
-      is_combo: true
-    };
-
-    console.log("  → " + dealName + " $" + totalPrice + " (base $" + basePrice + " + extra $" + round2(extraCharges) + ")");
-    res.json(result);
-  } catch (e) {
-    console.error("calculate_combo error:", e);
-    res.json({ error: "Combo pricing error: " + e.message });
-  }
-});
-
-
-// ═══════════════════════════════════════════════════════════════
-// ROUTE: search_menu — RAG-style menu discovery
-// Agent calls this when customer asks "what do you have?"
-// ═══════════════════════════════════════════════════════════════
-
-app.post("/retell/function/search_menu", function (req, res) {
-  try {
-    var data = req.body.args || req.body;
-    var query = (data.query || "").toLowerCase().trim();
-    var catFilter = (data.category || "").toLowerCase().trim();
-    console.log("\n=== SEARCH MENU ===");
-    console.log("  Query:", query, "Category:", catFilter);
-
-    if (!query && !catFilter) return res.json({ error: "Please provide a search query." });
-
-    // Handle deal/combo/special queries
-    var dealKW = ["deal","deals","special","specials","combo","combos","meal"];
-    if (dealKW.some(function(k) { return query.indexOf(k) !== -1; })) {
-      var deals = [];
-      for (var dk in MENU.deals) {
-        var d = MENU.deals[dk];
-        var dSizes = {};
-        for (var ds in d.sizes) { dSizes[ds === "0" ? "one size" : ds + " inch"] = "$" + d.sizes[ds].price.toFixed(2); }
-        deals.push({ name: dk.split(" ").map(function(w){return w.charAt(0).toUpperCase()+w.slice(1);}).join(" "), prices: dSizes });
-      }
-      return res.json({ query: query, count: deals.length, results: deals });
-    }
-
-    // Search all menu categories
-    var allCats = [
-      {items:MENU.pizzas, cat:"Pizzas"}, {items:MENU.specialty, cat:"Specialty Pizzas"},
-      {items:MENU.subs, cat:"Subs"}, {items:MENU.sandwiches, cat:"Sandwiches"},
-      {items:MENU.wraps, cat:"Wraps"}, {items:MENU.clubs, cat:"Clubs"},
-      {items:MENU.salads, cat:"Salads"}, {items:MENU.gyros, cat:"Gyro"},
-      {items:MENU.pasta, cat:"Pasta"}, {items:MENU.stromboli, cat:"Stromboli"},
-      {items:MENU.quesadillas, cat:"Quesadillas"}, {items:MENU.seafood, cat:"Seafood"},
-      {items:MENU.platters, cat:"Platters"}, {items:MENU.sides, cat:"Sides"},
-      {items:MENU.desserts, cat:"Desserts"}, {items:MENU.beverages, cat:"Beverages"}
-    ];
-
-    // Wings searched separately (different structure)
-    var results = [];
-
-    // Search wings
-    if (!catFilter || catFilter === "wings") {
-      if (query.indexOf("buffalo") !== -1 || query.indexOf("wing") !== -1 || catFilter === "wings") {
-        var bwPrices = MENU.buffalo_wings.map(function(w) { return w.qty + "pc=$" + w.price.toFixed(2); }).join(", ");
-        results.push({ name: "Buffalo Wings", category: "Wings", sizes: bwPrices });
-        var wwPrices = MENU.whole_wings.map(function(w) { return w.qty + "pc=$" + w.price.toFixed(2); }).join(", ");
-        results.push({ name: "Whole Wings", category: "Wings", sizes: wwPrices });
-      }
-    }
-
-    // Search nuggets/tenders
-    if (!catFilter || catFilter === "nuggets" || catFilter === "tenders") {
-      if (query.indexOf("nugget") !== -1 || query.indexOf("tender") !== -1) {
-        var nPrices = MENU.nuggets.map(function(n) { return n.qty + "pc=$" + n.price.toFixed(2); }).join(", ");
-        results.push({ name: "Chicken Nuggets", category: "Nuggets", sizes: nPrices });
-        var tPrices = MENU.tenders.map(function(t) { return t.qty + "pc=$" + t.price.toFixed(2); }).join(", ");
-        results.push({ name: "Chicken Tenders", category: "Tenders", sizes: tPrices });
-        var fnPrices = MENU.fish_nuggets.map(function(f) { return f.qty + "pc=$" + f.price.toFixed(2); }).join(", ");
-        results.push({ name: "Fish Nuggets", category: "Fish Nuggets", sizes: fnPrices });
-      }
-    }
-
-    for (var ci = 0; ci < allCats.length; ci++) {
-      var catObj = allCats[ci];
-      if (catFilter && catObj.cat.toLowerCase().indexOf(catFilter) === -1) continue;
-
-      for (var ii = 0; ii < catObj.items.length; ii++) {
-        var item = catObj.items[ii];
-        var nm = (item.name || "").toLowerCase();
-        var kws = item.keywords || [];
-        var match = false;
-
-        if (!query || catFilter) { match = true; }
-        else if (nm.indexOf(query) !== -1) { match = true; }
-        else {
-          for (var ki = 0; ki < kws.length; ki++) {
-            if (kws[ki].indexOf(query) !== -1 || query.indexOf(kws[ki]) !== -1) { match = true; break; }
-          }
-          // Word-level match
-          if (!match) {
-            var qWords = query.split(/\s+/);
-            var hits = 0;
-            for (var qi = 0; qi < qWords.length; qi++) {
-              if (nm.indexOf(qWords[qi]) !== -1) hits++;
-            }
-            if (hits > 0 && hits >= qWords.length * 0.5) match = true;
-          }
-        }
-
-        if (match) {
-          var entry = { name: item.name, category: catObj.cat, id: item.id };
-          if (item.prices) {
-            var szPrices = {};
-            for (var sz in item.prices) { szPrices[sz + " inch"] = "$" + item.prices[sz].toFixed(2); }
-            entry.sizes_and_prices = szPrices;
-          } else if (item.p8 !== undefined) {
-            entry.sizes_and_prices = { "8 inch (half)": "$" + item.p8.toFixed(2), "12 inch (whole)": "$" + item.p12.toFixed(2) };
-            if (item.premium) entry.premium = true;
-          } else if (item.price !== undefined) {
-            entry.price = "$" + item.price.toFixed(2);
-          }
-          results.push(entry);
-        }
-      }
-    }
-
-    // Cap at 12 results
-    results = results.slice(0, 12);
-    console.log("  → " + results.length + " results");
-    res.json({ query: query, count: results.length, results: results, message: results.length > 0 ? "Found " + results.length + " items." : "No items found for '" + query + "'." });
-  } catch (e) {
-    console.error("search_menu error:", e);
-    res.json({ error: "Search error: " + e.message });
-  }
-});
-
-
-// ═══════════════════════════════════════════════════════════════
-// ROUTE: modify_cart — deterministic cart modifications by UID
-// Agent calls this to remove, swap, or change quantity
-// ═══════════════════════════════════════════════════════════════
-
-app.post("/retell/function/modify_cart", function (req, res) {
-  try {
-    var data = req.body.args || req.body;
-    var callObj = req.body.call || {};
-    var dv = callObj.dynamic_variables || {};
-    console.log("\n=== MODIFY CART ===");
-    console.log("  Action:", data.action, "UID:", data.uid);
-
-    var basket = [];
-    try { basket = JSON.parse(dv.basket || "[]"); } catch (e) { basket = []; }
-    var action = (data.action || "").toLowerCase();
-    var uid = data.uid || "";
-    var now = Date.now();
-
-    if (action === "remove") {
-      if (!uid) return res.json({ success: false, message: "No uid provided. Read basket_summary to find the item uid." });
-      var removed = null;
-      var newBasket = [];
-      for (var ri = 0; ri < basket.length; ri++) {
-        if (basket[ri].uid === uid && !removed) {
-          removed = basket[ri];
-        } else {
-          newBasket.push(basket[ri]);
-        }
-      }
-      if (!removed) {
-        // Try name match as fallback
-        var searchName = (data.new_item_name || "").toLowerCase();
-        if (searchName) {
-          for (var si = 0; si < basket.length; si++) {
-            if ((basket[si].item_name || "").toLowerCase().indexOf(searchName) !== -1) {
-              removed = basket[si];
-              newBasket = basket.filter(function(_, idx) { return idx !== si; });
-              break;
-            }
-          }
-        }
-        if (!removed) return res.json({ success: false, message: "Item with uid '" + uid + "' not found. Check basket_summary." });
-      }
-      basket = newBasket;
-      console.log("  → Removed:", removed.item_name);
-    }
-
-    else if (action === "swap") {
-      if (!uid) return res.json({ success: false, message: "No uid provided for swap." });
-      var idx = -1;
-      for (var fi = 0; fi < basket.length; fi++) {
-        if (basket[fi].uid === uid) { idx = fi; break; }
-      }
-      if (idx === -1) return res.json({ success: false, message: "Item with uid '" + uid + "' not found." });
-
-      var oldName = basket[idx].item_name;
-      var newType = (data.new_item_type || "").toLowerCase();
-      var newName = data.new_item_name || "";
-
-      // Re-price the new item using existing pricing functions
-      var priced = null;
-      if (newType === "pizza") {
-        priced = pricePizza(data.new_size, data.new_toppings, 0);
-      } else if (newType === "sub") {
-        priced = priceSub(newName, data.new_size || "half", null, null, null);
-      } else if (newType === "wings" || newType === "buffalo wings") {
-        priced = priceWings("buffalo", data.new_quantity || 6);
-      } else {
-        priced = priceGenericItem(newName);
-      }
-
-      if (!priced || priced.error) return res.json({ success: false, message: priced ? priced.error : "Could not price new item." });
-
-      // Patch in-place, keep uid
-      basket[idx] = {
-        uid: basket[idx].uid,
-        item_name: priced.item_name,
-        item_id: String(priced.item_id || ""),
-        unit_price: priced.unit_price,
-        category: priced.category || "",
-        quantity: basket[idx].quantity || 1,
-        modifiers: priced.modifiers || [],
-        _ts: now
-      };
-      console.log("  → Swapped:", oldName, "→", priced.item_name);
-    }
-
-    else if (action === "change_quantity") {
-      if (!uid) return res.json({ success: false, message: "No uid provided." });
-      var found = false;
-      for (var qi = 0; qi < basket.length; qi++) {
-        if (basket[qi].uid === uid) {
-          basket[qi].quantity = parseInt(data.new_quantity) || 1;
-          found = true;
-          console.log("  → Qty:", basket[qi].item_name, "→", basket[qi].quantity);
-          break;
-        }
-      }
-      if (!found) return res.json({ success: false, message: "Item with uid '" + uid + "' not found." });
-    }
-
-    else {
-      return res.json({ success: false, message: "Unknown action '" + action + "'. Use remove, swap, or change_quantity." });
-    }
-
-    // Recalculate
-    var subtotal = 0;
-    var summaryParts = [];
-    for (var bi = 0; bi < basket.length; bi++) {
-      var bItem = basket[bi];
-      var bPrice = parseFloat(bItem.unit_price || 0);
-      var bQty = parseInt(bItem.quantity || 1);
-      subtotal += bPrice * bQty;
-      var line = "[" + bi + "] " + (bItem.uid || "?") + " " + (bItem.item_name || "?");
-      if (bQty > 1) line += " x" + bQty;
-      line += " $" + bPrice.toFixed(2);
-      summaryParts.push(line);
-    }
-
-    res.json({
-      success: true,
-      message: action === "remove" ? "Removed." : action === "swap" ? "Swapped." : "Updated.",
-      basket: JSON.stringify(basket),
-      item_count: basket.length,
-      subtotal: round2(subtotal),
-      basket_summary: summaryParts.join(" | ") || "(empty)",
-      last_action_ts: String(now)
-    });
-  } catch (e) {
-    console.error("modify_cart error:", e);
-    res.json({ success: false, message: "Error: " + e.message });
-  }
-});
-
-
 app.get("/debug", function (req, res) { res.json({ total: orderLog.length, orders: orderLog }); });
 
 // ═══════════════════════════════════════════════════
@@ -2928,75 +1178,1144 @@ app.get("/order/:ref", function (req, res) {
       }
     }
   }
+
   receipt += "───────────────────────────────────────\n";
-  receipt += "Subtotal: $" + parseFloat(found.total || 0).toFixed(2) + "\n";
+  receipt += "Total: $" + parseFloat(found.total || 0).toFixed(2) + "\n";
   receipt += "═══════════════════════════════════════\n";
-  res.type("text/plain").send(receipt);
+
+  res.set("Content-Type", "text/plain; charset=utf-8");
+  res.send(receipt);
 });
 
-// ═══════════════════════════════════════════════════════════════
-// ADMIN ENDPOINTS
-// ═══════════════════════════════════════════════════════════════
+app.get("/test-order", async function (req, res) {
+  var order = { order_type: "pickup", customer_name: "Test Regular", customer_phone: "8888888888",
+    items: [{ item_name: '14" Large Cheese Pizza', item_id: "737", quantity: 1, unit_price: 11.99, modifiers: [{ group: "Add Toppings", name: "Pepperoni", price: 2.0 }] }],
+    subtotal: 13.99, tax: 0.84, total: 14.83 };
+  var built = buildXml(order);
+  var result = await sendToPOS(built.xml);
+  res.json({ version: "V15", xml: built.xml, pos: result, ref: built.ref });
+});
 
+app.get("/test-combo", async function (req, res) {
+  var order = { order_type: "pickup", customer_name: "Test Combo", customer_phone: "8888888888",
+    items: [{ item_name: '12"PIZZA W/1 TOP 8"SUB, 6 BUFFALO WING and 2 CAN OF SODA', item_id: "769", quantity: 1, unit_price: 29.99, is_combo: true,
+      components: [
+        { component_name: '12" Cheese Pizza', item_id: "736", modifiers: [{ group: "Add Toppings", name: "Pepperoni", price: 0 }] },
+        { component_name: 'CHEESE STEAK SUB', item_id: "684", modifiers: [{ group: "Sub Fixins", name: "Everything", price: 0 }, { group: "Cheese Options", name: "American", price: 0 }] },
+        { component_name: "6pcs Buffalo wings", item_id: "579", modifiers: [{ group: "Wings - Flavors", name: "Hot", price: 0 }, { group: "Wings - Dressing", name: "Ranch", price: 0 }] },
+        { component_name: "Soda", item_id: "728", modifiers: [{ group: "Soda Can", name: "Coke", price: 0 }] },
+        { component_name: "Soda", item_id: "728", modifiers: [{ group: "Soda Can", name: "Coke", price: 0 }] }
+      ] }],
+    subtotal: 29.99, tax: 1.80, total: 31.79 };
+  var built = buildXml(order);
+  var result = await sendToPOS(built.xml);
+  res.json({ version: "V15", xml: built.xml, pos: result, ref: built.ref });
+});
+
+app.get("/test-delivery", async function (req, res) {
+  var order = { order_type: "delivery", customer_name: "Test Delivery", customer_phone: "4105551234",
+    delivery_address: "2755 Edmondson Ave, Baltimore, MD 21223",
+    items: [{ item_name: '14" Large Cheese Pizza', item_id: "737", quantity: 1, unit_price: 11.99, modifiers: [{ group: "Add Toppings", name: "Pepperoni", price: 2.0 }] }],
+    subtotal: 13.99, tax: 0.84, total: 16.78 };
+  var built = buildXml(order);
+  var result = await sendToPOS(built.xml);
+  res.json({ version: "V15", xml: built.xml, pos: result, ref: built.ref });
+});
+
+app.get("/raw-xml", function (req, res) {
+  var order = { order_type: "pickup", customer_name: "Raw Test", customer_phone: "8888888888",
+    items: [{ item_name: 'Test Pizza', quantity: 1, unit_price: 11.99, modifiers: [{ group: "Add Toppings", name: "Pepperoni", price: 2.0 }] }],
+    subtotal: 13.99, tax: 0.84, total: 14.83 };
+  var built = buildXml(order);
+  res.set("Content-Type", "text/plain; charset=utf-8");
+  res.send(built.xml);
+});
+
+app.get("/raw-lastorder", function (req, res) {
+  res.set("Content-Type", "text/plain; charset=utf-8");
+  if (orderLog.length > 0 && orderLog[0].xml) { res.send(orderLog[0].xml); } else { res.send("No orders yet"); }
+});
+
+app.get("/tag-test", function (req, res) {
+  res.set("Content-Type", "text/plain; charset=utf-8");
+  res.send("NT variable resolves to: [" + NT + "]\nNTC variable resolves to: [" + NTC + "]\nSample: " + NT + "Pepperoni" + NTC);
+});
+
+// TEST ADDRESS: visit /test-address?q=123+Main+St+Chicago+IL
+app.get("/test-address", async function (req, res) {
+  var addr = req.query.q || req.query.address || "";
+  if (!addr) return res.json({ error: "Add ?q=your+address to the URL. Example: /test-address?q=123+Main+St+Chicago+IL" });
+  // Simulate what Retell sends
+  var fakeReq = { body: { args: { address: addr } } };
+  var fakeRes = { json: function (result) { res.json({ input: addr, result: result, has_api_key: !!CONFIG.GOOGLE_MAPS_API_KEY }); } };
+  // Call the real verify function
+  app.handle({ method: "POST", url: "/retell/function/verify_address", headers: { "content-type": "application/json" }, body: JSON.stringify({ args: { address: addr } }) }, fakeRes);
+});
+
+// Simpler test-address that calls Google directly
+app.get("/test-address2", async function (req, res) {
+  var addr = req.query.q || "";
+  if (!addr) return res.json({ error: "Add ?q=your+address. Example: /test-address2?q=123+Main+St+Chicago+IL" });
+  if (!CONFIG.GOOGLE_MAPS_API_KEY) return res.json({ error: "No GOOGLE_MAPS_API_KEY set in environment" });
+  try {
+    var r = await fetch("https://maps.googleapis.com/maps/api/geocode/json?address=" + encodeURIComponent(addr) + "&key=" + CONFIG.GOOGLE_MAPS_API_KEY);
+    var geo = await r.json();
+    res.json({ input: addr, status: geo.status, results_count: geo.results ? geo.results.length : 0, results: geo.results || [], error_message: geo.error_message || null });
+  } catch (e) { res.json({ error: e.message }); }
+});
+
+app.get("/", function (req, res) {
+  res.json({ status: "running", version: "V16", restaurant_id: CONFIG.RESTAURANT_ID,
+    has_payment: !!process.env.USAEPAY_KEY,
+    endpoints: ["POST /retell/function/submit_order", "POST /retell/function/verify_address", "POST /retell/function/process_payment", "POST /retell/function/get_caller_id",
+      "POST /retell/function/calculate_price", "POST /retell/function/calculate_combo",
+      "GET /orders (clean receipt list)", "GET /order/:ref (single receipt)", "GET /payment-log",
+      "GET /test-order", "GET /test-combo", "GET /test-delivery", "GET /test-payment", "GET /debug"] });
+});
+
+// ═══════════════════════════════════════════════════
+// PRICING ENGINE — complete menu database + calculation tools
+// Agent calls these tools instead of doing math
+// ═══════════════════════════════════════════════════
+
+// Pizza topping prices by size, and modifier IDs
+var TOPPING_PRICES = {
+  10: {full:1.00, half:0.50, shrimp:1.50, anchovy:1.50, shrimp_half:1.00, anchovy_half:1.00},
+  12: {full:1.50, half:0.75, shrimp:2.00, anchovy:2.00, shrimp_half:1.00, anchovy_half:1.00},
+  14: {full:2.00, half:1.00, shrimp:2.00, anchovy:2.00, shrimp_half:1.25, anchovy_half:1.25},
+  16: {full:2.50, half:1.25, shrimp:3.50, anchovy:3.50, shrimp_half:1.75, anchovy_half:1.75},
+  18: {full:3.00, half:1.50, shrimp:4.00, anchovy:4.00, shrimp_half:2.00, anchovy_half:2.00}
+};
+
+// Topping modifier IDs by size (full)
+var TOPPING_IDS = {
+  10: {ground_beef:749,ham:750,sausage:751,pepperoni:752,black_olives:753,jalapenos:754,green_peppers:755,mushrooms:756,onions:757,chicken:758,pineapple:759,sweet_peppers:760,banana_peppers:761,broccoli:762,spinach:763,bacon:764,extra_cheese:765,tomatoes:766,shrimp:854,anchovy:855,welldone:767,lite_sauce:768,extra_sauce:769},
+  12: {ground_beef:940,ham:941,sausage:942,pepperoni:943,black_olives:944,jalapenos:945,green_peppers:946,mushrooms:947,onions:948,chicken:949,pineapple:950,sweet_peppers:951,banana_peppers:952,broccoli:953,spinach:954,bacon:955,extra_cheese:956,tomatoes:957,shrimp:961,anchovy:962,welldone:958,lite_sauce:959,extra_sauce:960},
+  14: {ground_beef:963,ham:964,sausage:965,pepperoni:966,black_olives:967,jalapenos:968,green_peppers:969,mushrooms:970,onions:971,chicken:972,pineapple:973,sweet_peppers:974,banana_peppers:975,broccoli:976,spinach:977,bacon:978,extra_cheese:979,tomatoes:980,shrimp:984,anchovy:985,welldone:981,lite_sauce:982,extra_sauce:983},
+  16: {ground_beef:986,ham:987,sausage:988,pepperoni:989,black_olives:990,jalapenos:991,green_peppers:992,mushrooms:993,onions:994,chicken:995,pineapple:996,sweet_peppers:997,banana_peppers:998,broccoli:999,spinach:1000,bacon:1001,extra_cheese:1002,tomatoes:1003,shrimp:1007,anchovy:1008,welldone:1004,lite_sauce:1005,extra_sauce:1006},
+  18: {ground_beef:1009,ham:1010,sausage:1011,pepperoni:1012,black_olives:1013,jalapenos:1014,green_peppers:1015,mushrooms:1016,onions:1017,chicken:1018,pineapple:1019,sweet_peppers:1020,banana_peppers:1021,broccoli:1022,spinach:1023,bacon:1024,extra_cheese:1025,tomatoes:1026,shrimp:1030,anchovy:1031,welldone:1027,lite_sauce:1028,extra_sauce:1029}
+};
+
+var FREE_TOPPINGS = ["welldone","lite_sauce","extra_sauce","lite_cheese","no_sauce"];
+
+function normTopping(name) {
+  return (name||"").toLowerCase().replace(/[^a-z]/g,"_").replace(/_+/g,"_").replace(/^_|_$/g,"");
+}
+
+// Alias map: common agent spellings → DB key
+var TOPPING_ALIASES = {
+  "jalapeno": "jalapenos", "jalape_o": "jalapenos", "jalapeño": "jalapenos", "jalapeños": "jalapenos",
+  "onion": "onions", "mushroom": "mushrooms", "olive": "black_olives",
+  "black_olive": "black_olives", "green_pepper": "green_peppers",
+  "sweet_pepper": "sweet_peppers", "banana_pepper": "banana_peppers",
+  "tomato": "tomatoes", "anchovi": "anchovy",
+  "pepper": "green_peppers", "pineapples": "pineapple"
+};
+
+// Universal modifier aliases — covers all modifier types
+var MODIFIER_ALIASES = {
+  // Sub fixins
+  "tomato": "tomatoes", "onion": "onions", "hot pepper": "hot_peppers",
+  "hot_pepper": "hot_peppers", "hots": "hot_peppers", "hot": "hot_peppers",
+  "raw_onion": "raw_onions", "grilled_onion": "grilled_onions",
+  "pickle": "pickles", "salt_pepper": "salt_n_pepper", "salt pepper": "salt_n_pepper",
+  "salt and pepper": "salt_n_pepper", "no hots": "everything_no_hots",
+  "everything no hots": "everything_no_hots",
+  // Cheese
+  "feta": "feta_cheese", "no cheese": "no_cheese", "extra cheese": "extra_cheese",
+  "provolone cheese": "provolone", "american cheese": "american", "mozz": "mozzarella",
+  // Wing flavors
+  "general tso": "general_tso_s", "general tsos": "general_tso_s",
+  "no sauce": "no_flavor", "plain": "no_flavor", "no flavor": "no_flavor",
+  // Wing dressings
+  "bleu cheese": "blue_cheese", "bleu_cheese": "blue_cheese",
+  // Soda
+  "diet coke": "diet_coke", "diet pepsi": "diet_pepsi", "cherry coke": "cherry_coke",
+  "cherry pepsi": "cherry_pepsi", "coke zero": "coke_zero", "mountain dew": "mountain_dew",
+  "dr pepper": "dr_pepper", "dr_pepper": "dr_pepper", "dr. pepper": "dr_pepper",
+  "root beer": "root_beer", "ginger ale": "ginger_ale", "sierra mist": "sierra_mist",
+  "fanta orange": "fanta_orange", "fanta grape": "fanta_grape",
+  "fanta strawberry": "fanta_strawberry", "fanta pineapple": "fanta_pineapple",
+  "crush grape": "crush_grape", "fruit punch": "fruit_punch",
+  "half and half": "half_and_half", "half n half": "half_and_half",
+  "starry": "starry_lemon_lime", "starry lemon lime": "starry_lemon_lime",
+  // Salad dressing
+  "creamy italian": "creamy_italian", "thousand island": "thousand_island",
+  "balsamic vinaigrette": "balsamic_vinaigrette", "balsamic": "balsamic_vinaigrette",
+  // Tender sauce
+  "honey mustard": "honey_mustard", "blue cheese": "blue_cheese",
+  "honey bbq": "honey_bbq", "honey barbeque": "honey_bbq"
+};
+
+// Universal fuzzy resolve for key-based lookups (SUB_FIXINS_IDS, CHEESE_IDS, etc.)
+function resolveModifier(input, map) {
+  var n = normTopping(input);
+  // 1. Exact match
+  if (map[n] !== undefined) return n;
+  // 2. Modifier alias
+  if (MODIFIER_ALIASES[n] && map[MODIFIER_ALIASES[n]] !== undefined) return MODIFIER_ALIASES[n];
+  // 3. Topping alias (reuse)
+  if (TOPPING_ALIASES[n] && map[TOPPING_ALIASES[n]] !== undefined) return TOPPING_ALIASES[n];
+  // 4. Try with 's'
+  if (map[n + "s"] !== undefined) return n + "s";
+  // 5. Try without 's'
+  if (n.endsWith("s") && map[n.slice(0,-1)] !== undefined) return n.slice(0,-1);
+  // 6. Try without 'es'
+  if (n.endsWith("es") && map[n.slice(0,-2)] !== undefined) return n.slice(0,-2);
+  // 7. Try raw lowercase input (for exact DB name matches like "Diet Coke")
+  var raw = (input||"").toLowerCase().trim();
+  if (map[raw] !== undefined) return raw;
+  return null;
+}
+
+// Universal fuzzy match for DB array lookups (.find on array of objects)
+// nameField = which property to match against (e.g., "flavor_name", "fixin_name", "dressing_name")
+function fuzzyFindInArray(input, arr, nameField) {
+  if (!arr || !arr.length) return null;
+  var raw = (input||"").toLowerCase().trim();
+  var norm = normTopping(input);
+  
+  // 1. Exact name match (case-insensitive)
+  for (var i = 0; i < arr.length; i++) {
+    if ((arr[i][nameField]||"").toLowerCase().trim() === raw) return arr[i];
+  }
+  // 2. Normalized match
+  for (var i = 0; i < arr.length; i++) {
+    if (normTopping(arr[i][nameField]) === norm) return arr[i];
+  }
+  // 3. Alias match
+  var aliasNorm = MODIFIER_ALIASES[norm] || TOPPING_ALIASES[norm] || null;
+  if (aliasNorm) {
+    for (var i = 0; i < arr.length; i++) {
+      if (normTopping(arr[i][nameField]) === aliasNorm) return arr[i];
+    }
+  }
+  // 4. Add/remove 's'
+  var variants = [norm + "s"];
+  if (norm.endsWith("s")) variants.push(norm.slice(0,-1));
+  if (norm.endsWith("es")) variants.push(norm.slice(0,-2));
+  for (var v = 0; v < variants.length; v++) {
+    for (var i = 0; i < arr.length; i++) {
+      if (normTopping(arr[i][nameField]) === variants[v]) return arr[i];
+    }
+  }
+  // 5. Partial contains (last resort)
+  for (var i = 0; i < arr.length; i++) {
+    var dbNorm = normTopping(arr[i][nameField]);
+    if (dbNorm.indexOf(norm) !== -1 || norm.indexOf(dbNorm) !== -1) return arr[i];
+  }
+  return null;
+}
+
+function resolveTopping(norm, sp) {
+  // Try exact match first
+  if (sp[norm] !== undefined) return norm;
+  // Try alias
+  if (TOPPING_ALIASES[norm] && sp[TOPPING_ALIASES[norm]] !== undefined) return TOPPING_ALIASES[norm];
+  // Try adding 's'
+  if (sp[norm + "s"] !== undefined) return norm + "s";
+  // Try removing trailing 's'
+  if (norm.endsWith("s") && sp[norm.slice(0,-1)] !== undefined) return norm.slice(0,-1);
+  // Try removing trailing 'es'
+  if (norm.endsWith("es") && sp[norm.slice(0,-2)] !== undefined) return norm.slice(0,-2);
+  // Partial match: find key where first 5+ chars match (handles jalape_os vs jalapenos)
+  if (norm.length >= 5) {
+    var prefix = norm.substring(0, 5);
+    var keys = Object.keys(sp);
+    for (var i = 0; i < keys.length; i++) {
+      if (keys[i].substring(0, 5) === prefix) return keys[i];
+    }
+  }
+  return null;
+}
+
+function getToppingPrice(name, size, isHalf) {
+  var n = normTopping(name);
+  if (FREE_TOPPINGS.indexOf(n) !== -1) return 0;
+  // Also check aliases for free toppings
+  var alias = TOPPING_ALIASES[n];
+  if (alias && FREE_TOPPINGS.indexOf(alias) !== -1) return 0;
+  
+  var sp = TOPPING_PRICES[size];
+  if (!sp) return 0;
+  
+  // Resolve the key (handles singular/plural/aliases)
+  var key = resolveTopping(n, sp);
+  
+  // DB format: sp[topping_name] = {full, half}
+  if (key && sp[key] && typeof sp[key] === "object") return isHalf ? (sp[key].half || 0) : (sp[key].full || 0);
+  
+  // Hardcoded format: sp = {full, half, shrimp, shrimp_half, ...}
+  if (n === "shrimp" || alias === "shrimp") return isHalf ? (sp.shrimp_half || sp.half || 0) : (sp.shrimp || sp.full || 0);
+  if (n === "anchovy" || n === "anchovi" || alias === "anchovy") return isHalf ? (sp.anchovy_half || sp.half || 0) : (sp.anchovy || sp.full || 0);
+  return isHalf ? (sp.half || 0) : (sp.full || 0);
+}
+
+function getToppingId(name, size) {
+  var n = normTopping(name);
+  var ids = TOPPING_IDS[size];
+  if (!ids) return null;
+  // Try exact, then resolve
+  if (ids[n]) return ids[n];
+  var key = resolveTopping(n, ids);
+  if (key && ids[key]) return ids[key];
+  return null;
+}
+
+// Complete sub database
+var SUBS_DB = [
+  // Grilled
+  {keys:["cheese steak","cheesesteak","cs sub"], id:684, name:"Cheese Steak Sub", p8:8.49, p12:12.49},
+  {keys:["chicken cheese steak","chicken cheesesteak","chicken cs"], id:685, name:"Chicken Cheese Steak Sub", p8:8.49, p12:12.49},
+  {keys:["cheese burger sub","cheeseburger sub"], id:686, name:"Cheese Burger Sub", p8:8.49, p12:12.49},
+  {keys:["steak sub"], id:687, name:"Steak Sub", p8:8.49, p12:12.49},
+  {keys:["hamburger sub","hamburger"], id:688, name:"Hamburger Sub", p8:7.99, p12:11.99},
+  {keys:["meat ball","meatball","meatball sub"], id:689, name:"Meat Ball Sub", p8:7.99, p12:11.99},
+  {keys:["turkey burger sub","turkey burger"], id:690, name:"Turkey Burger Sub", p8:7.99, p12:11.99},
+  {keys:["chicken parmesan","chicken parm sub","chicken parm"], id:691, name:"Chicken Parmesan Sub", p8:8.49, p12:12.49},
+  {keys:["grilled chicken sub","chicken sub"], id:692, name:"Grilled Chicken Sub", p8:8.49, p12:12.49},
+  {keys:["chicken fillet","chicken fillet sub"], id:693, name:"Chicken Fillet Sub", p8:8.49, p12:12.49},
+  {keys:["pizza sub"], id:694, name:"Pizza Sub", p8:7.99, p12:11.99},
+  {keys:["chilli sub","chili sub","chili"], id:695, name:"Chilli Sub", p8:7.99, p12:11.99},
+  {keys:["cheese fish sub","fish sub"], id:801, name:"Cheese Fish Sub", p8:8.49, p12:12.49},
+  {keys:["crab cake sub","crab sub"], id:833, name:"Crab Cake Sub", p8:9.49, p12:13.49},
+  // Cold cuts
+  {keys:["italian cold cut","italian cold"], id:702, name:"Italian Cold Cut Sub", p8:7.99, p12:11.99},
+  {keys:["italian hot cut","italian hot"], id:703, name:"Italian Hot Cut Sub", p8:7.99, p12:11.99},
+  {keys:["turkey breast sub","turkey sub","turkey breast"], id:704, name:"Turkey Breast Sub", p8:7.99, p12:11.99},
+  {keys:["ham and cheese","ham cheese sub","ham sub"], id:705, name:"Ham and Cheese Sub", p8:7.99, p12:11.99},
+  {keys:["tuna salad sub","tuna sub","tuna"], id:706, name:"Tuna Salad Sub", p8:7.99, p12:11.99},
+  {keys:["chicago cold cut","chicago cold","chicago sub"], id:707, name:"Chicago Cold Cut Sub", p8:8.49, p12:12.49},
+  {keys:["chicken salad sub","chicken salad"], id:708, name:"Chicken Salad Sub", p8:7.99, p12:11.99},
+  {keys:["chipotle sub","chipotle"], id:709, name:"Chipotle Sub", p8:8.49, p12:12.49},
+  {keys:["shrimp salad sub","shrimp salad"], id:710, name:"Shrimp Salad Sub", p8:8.99, p12:12.99},
+  {keys:["regular cold cut","american cold cut","regular cold"], id:825, name:"Regular Cold Cut Sub", p8:7.49, p12:10.99},
+  {keys:["regular hot cut","american hot cut","regular hot"], id:826, name:"Regular Hot Cut Sub", p8:7.49, p12:10.99},
+  // Special — MUST be before cheese steak to match "philly cheese steak" before "cheese steak"
+  {keys:["shrimp cheese steak","shrimp cheesesteak","shrimp cs"], id:726, name:"Shrimp Cheese Steak Sub", p8:9.99, p12:14.49},
+  {keys:["philly cheese steak sub","philly cheesesteak sub","philly cs sub","philly cheese steak","philly cheesesteak","philly cs","philly sub"], id:723, name:"Philly Cheese Steak Sub", p8:9.49, p12:13.99},
+  {keys:["philly chicken","philly chicken sub"], id:724, name:"Philly Chicken Sub", p8:9.49, p12:13.99},
+  {keys:["cheese steak special","cheesesteak special","cs special"], id:725, name:"Cheese Steak Special Sub", p8:9.49, p12:13.49},
+  {keys:["veggie sub","veggie"], id:727, name:"Veggie Sub", p8:8.49, p12:12.49},
+];
+
+// Sub fixins modifier IDs
+var SUB_FIXINS_IDS = {everything:463,lettuce:464,tomatoes:465,mayo:466,mustard:467,ketchup:468,onions:469,hot_peppers:470,raw_onions:746,grilled_onions:747,everything_no_hots:1302,pickles:1304,salt_n_pepper:1305,extra_meat:471,bacon:472,extra_cheese:473,shrimp:748,ham:744,turkey:745};
+var SUB_FIXINS_PRICES = {extra_meat:1.00,bacon:1.00,extra_cheese:1.00,shrimp:1.00};
+var CHEESE_IDS = {american:488,provolone:489,mozzarella:492,feta_cheese:493,feta:493,no_cheese:491,extra_cheese:490};
+var CHEESE_PRICES = {extra_cheese:1.00};
+
+// Combo deals database
+var COMBO_DB = {
+  "double deal": {sizes:{12:{id:786,price:19.99},14:{id:787,price:21.99},16:{id:788,price:24.99}}, desc:"2 same-size cheese pizzas (1 top each)", pizzas:2, freeToppings:1},
+  "3 pizza special": {sizes:{14:{id:777,price:36.99},16:{id:778,price:38.99}}, desc:"3 same-size cheese pizzas (1 top each) + 2L soda", pizzas:3, freeToppings:1, includes_2l:true},
+  "three pizza special": {sizes:{14:{id:777,price:36.99},16:{id:778,price:38.99}}, desc:"3 same-size cheese pizzas (1 top each) + 2L soda", pizzas:3, freeToppings:1, includes_2l:true},
+  "pizza and wings": {sizes:{12:{id:781,price:25.99},14:{id:782,price:26.99},16:{id:783,price:27.99}}, desc:"pizza (1 top) + 10 buffalo wings + 2L soda", pizzas:1, freeToppings:1, includes_2l:true, wings:10},
+  "family deal": {sizes:{12:{id:781,price:25.99},14:{id:782,price:26.99},16:{id:783,price:27.99}}, desc:"pizza (1 top) + 10 buffalo wings + 2L soda", pizzas:1, freeToppings:1, includes_2l:true, wings:10},
+  "pizza and sub": {sizes:{12:{id:784,price:22.99},14:{id:794,price:24.99},16:{id:744,price:26.99}}, desc:"pizza (1 top) + 8\" sub + fries + can soda", pizzas:1, freeToppings:1, includes_fries:true, includes_can:true},
+  "pizza sub combo": {sizes:{12:{id:784,price:22.99},14:{id:794,price:24.99},16:{id:744,price:26.99}}, desc:"pizza (1 top) + 8\" sub + fries + can soda", pizzas:1, freeToppings:1, includes_fries:true, includes_can:true},
+  "combo deal": {sizes:{12:{id:769,price:29.99},14:{id:770,price:33.99}}, desc:"pizza (1 top) + 8\" sub + wings + 2 cans", pizzas:1, freeToppings:1},
+  "sub combo": {sizes:{8:{id:772,price:11.99},12:{id:774,price:15.99}}, desc:"sub + fries + can soda", pizzas:0, includes_fries:true, includes_can:true},
+  "2 sub combo": {sizes:{0:{id:773,price:21.99}}, desc:"2 subs + 2 fries + 2 cans", pizzas:0},
+  "two sub combo": {sizes:{0:{id:773,price:21.99}}, desc:"2 subs + 2 fries + 2 cans", pizzas:0},
+  "3 sub combo": {sizes:{0:{id:780,price:31.99}}, desc:"3 subs + 3 fries + 3 cans", pizzas:0},
+  "three sub combo": {sizes:{0:{id:780,price:31.99}}, desc:"3 subs + 3 fries + 3 cans", pizzas:0},
+  "wings and sub": {sizes:{0:{id:771,price:17.99}}, desc:"8\" sub + 6 buffalo wings + can soda", pizzas:0},
+  "wings special buffalo": {sizes:{0:{id:840,price:9.49}}, desc:"6 buffalo wings + fries + can soda", pizzas:0},
+  "wings special whole": {sizes:{0:{id:839,price:10.49}}, desc:"4 whole wings + fries + can soda", pizzas:0},
+  "chicken box whole": {sizes:{0:{id:838,price:20.99}}, desc:"2x 4pc whole wings + 2 cans", pizzas:0},
+  "chicken box buffalo": {sizes:{0:{id:847,price:25.99}}, desc:"2x 6pc buffalo wings + 2 cans", pizzas:0},
+  "burger combo": {sizes:{0:{id:793,price:7.99}}, desc:"cheeseburger sandwich + fries + can soda", pizzas:0},
+  "fish combo": {sizes:{0:{id:831,price:8.99}}, desc:"cheese fish sandwich + fries + can soda", pizzas:0},
+  "party deal": {sizes:{0:{id:776,price:84.99}}, desc:"4 large cheese pizzas + 48 wings + fries + 2L", pizzas:4, freeToppings:1},
+};
+
+function matchSub(input) {
+  var nm = (input||"").toLowerCase().replace(/[^a-z ]/g,"").trim();
+  // Sort by key length descending so "shrimp cheese steak" matches before "cheese steak"
+  var sorted = SUBS_DB.slice().sort(function(a,b) {
+    var aMax = Math.max.apply(null, a.keys.map(function(k){return k.length;}));
+    var bMax = Math.max.apply(null, b.keys.map(function(k){return k.length;}));
+    return bMax - aMax;
+  });
+  for (var i = 0; i < sorted.length; i++) {
+    for (var k = 0; k < sorted[i].keys.length; k++) {
+      if (nm.indexOf(sorted[i].keys[k]) !== -1) return sorted[i];
+    }
+  }
+  return null;
+}
+
+function buildModifiers(toppings, size, freeToppingsCount) {
+  var mods = [];
+  var chargeableSoFar = 0;
+  var totalExtra = 0;
+  
+  for (var t = 0; t < toppings.length; t++) {
+    var top = toppings[t];
+    var topName = (top.name || top || "").trim();
+    var isHalf = !!(top.half || (topName.toLowerCase().indexOf("half") !== -1));
+    var cleanName = topName.replace(/\s*\(half\)\s*/gi,"").replace(/^half\s+/i,"").trim();
+    var norm = normTopping(cleanName);
+    
+    // Skip free toppings (check aliases too)
+    var normAlias = TOPPING_ALIASES[norm] || norm;
+    if (FREE_TOPPINGS.indexOf(norm) !== -1 || FREE_TOPPINGS.indexOf(normAlias) !== -1) {
+      mods.push({name: cleanName, modifier_id: getToppingId(cleanName, size), group: "Add Toppings", price: 0, charge: 0});
+      continue;
+    }
+    
+    chargeableSoFar++;
+    var isFree = chargeableSoFar <= freeToppingsCount;
+    var price = isFree ? 0 : getToppingPrice(cleanName, size, isHalf);
+    totalExtra += price;
+    
+    var displayName = cleanName;
+    if (isHalf) displayName = cleanName + " (Half)";
+    
+    mods.push({
+      name: displayName,
+      modifier_id: getToppingId(cleanName, size),
+      group: "Add Toppings",
+      price: price,
+      charge: price
+    });
+  }
+  return {modifiers: mods, extra_charge: totalExtra};
+}
+
+// Generic menu item search — matches by keywords, longest match first
+function findMenuItem(input) {
+  var nm = (input || "").toLowerCase().replace(/[^a-z0-9 ]/g, "").trim();
+  if (!nm) return null;
+  
+  var items = MENU_CACHE.items.length > 0 ? MENU_CACHE.items : [];
+  var best = null;
+  var bestLen = 0;
+  
+  for (var i = 0; i < items.length; i++) {
+    var kws = items[i].keywords || [];
+    for (var k = 0; k < kws.length; k++) {
+      if (nm.indexOf(kws[k]) !== -1 && kws[k].length > bestLen) {
+        best = items[i];
+        bestLen = kws[k].length;
+      }
+    }
+    // Also match item_name directly
+    if (nm.indexOf(items[i].item_name.toLowerCase()) !== -1 && items[i].item_name.length > bestLen) {
+      best = items[i];
+      bestLen = items[i].item_name.length;
+    }
+  }
+  return best;
+}
+
+// ═══════════════════════════════════════════════════
+// TOOL 1: calculate_price — for ALL menu items
+// ═══════════════════════════════════════════════════
+app.post("/retell/function/calculate_price", function (req, res) {
+  try {
+    var args = req.body.args || req.body;
+    var itemType = (args.item_type || "").toLowerCase().trim();
+    var size = parseInt(args.size || 0);
+    var toppings = args.toppings || [];
+    var subName = (args.sub_name || args.item_name || "").trim();
+    var subSize = (args.sub_size || "half").toLowerCase();
+    var fixins = args.fixins || [];
+    var cheese = (args.cheese || "").trim();
+    var specialInstructions = (args.special_instructions || "").trim();
+    // Additional params for all item types
+    args.wing_flavor = args.wing_flavor || "";
+    args.wing_dressing = args.wing_dressing || "";
+    args.salad_dressing = args.salad_dressing || "";
+    args.gyro_meat = args.gyro_meat || "";
+    args.tender_sauce = args.tender_sauce || "";
+    args.soda_flavor = args.soda_flavor || "";
+    args.quantity = args.quantity || 0;
+
+    // ── PIZZA ──
+    if (itemType === "pizza" || itemType === "cheese pizza" || itemType === "specialty pizza") {
+      if (!size || !TOPPING_PRICES[size]) {
+        return res.json("ERROR: Invalid pizza size. Must be 10, 12, 14, 16, or 18.");
+      }
+      var pizzaIds = {10:735, 12:736, 14:737, 16:738, 18:739};
+      var pizzaPrices = {10:8.99, 12:10.99, 14:11.99, 16:13.99, 18:14.99};
+      var sizeLabels = {10:"Sm",12:"Med",14:"Lrg",16:"XL",18:"XXL"};
+      
+      // Check for specialty pizza
+      var pizzaName = (args.pizza_name || args.item_name || "").toLowerCase();
+      var isSpecialty = false;
+      if (pizzaName && itemType === "specialty pizza") {
+        var specMatch = findMenuItem(pizzaName);
+        if (specMatch && specMatch.item_type === "specialty_pizza") {
+          var specPrice = parseFloat(specMatch["price_" + size] || 0);
+          if (specPrice > 0) {
+            return res.json({
+              item_name: size + " inch " + sizeLabels[size] + " " + specMatch.item_name,
+              item_id: specMatch.pos_id,
+              category: "Pizzas",
+              base_price: specPrice,
+              unit_price: specPrice,
+              modifiers: [],
+              note: "Specialty pizzas do not qualify for combo deals.",
+              special_instructions: specialInstructions || undefined
+            });
+          }
+        }
+        return res.json("ERROR: Specialty pizza not found. Available: Deluxe, Supreme, Veggie, Hawaiian, Steak, Philly CS, NY Style, Buffalo Chicken, BBQ Chicken, Chicken Bacon Ranch, Meat Lover, Meal Buster, Unique.");
+      }
+      
+      // Cheese pizza — use DB prices if available
+      var cheesePizzaDB = MENU_CACHE.items.find(function(i) { return i.item_type === "cheese_pizza"; });
+      var basePrice = cheesePizzaDB ? parseFloat(cheesePizzaDB["price_" + size] || pizzaPrices[size]) : pizzaPrices[size];
+      var result = buildModifiers(toppings, size, 0); // 0 free toppings for regular pizza
+      var unitPrice = basePrice + result.extra_charge;
+      
+      return res.json({
+        item_name: size + " inch " + sizeLabels[size] + " Cheese Pizza",
+        item_id: pizzaIds[size],
+        category: "Pizzas",
+        base_price: basePrice,
+        topping_charges: result.extra_charge,
+        unit_price: unitPrice,
+        modifiers: result.modifiers,
+        special_instructions: specialInstructions || undefined
+      });
+    }
+
+    // ── SUB ──
+    if (itemType === "sub" || itemType === "submarine") {
+      var sub = matchSub(subName);
+      if (!sub) return res.json("ERROR: Sub not found. Available subs: cheese steak, chicken cheese steak, philly cheese steak, shrimp cheese steak, italian cold cut, turkey breast, ham and cheese, tuna, meatball, grilled chicken, pizza sub, veggie, and more.");
+      
+      var is12 = (subSize === "whole" || subSize === "12" || subSize === "12 inch");
+      var subPrice = is12 ? sub.p12 : sub.p8;
+      var sizePrefix = is12 ? "12 inch Whole " : "8 inch Half ";
+      
+      // Build fixins modifiers
+      var fixinMods = [];
+      var fixinExtra = 0;
+      for (var f = 0; f < fixins.length; f++) {
+        var fn = normTopping(fixins[f]);
+        var fkey = resolveModifier(fixins[f], SUB_FIXINS_IDS);
+        var fid = fkey ? SUB_FIXINS_IDS[fkey] : null;
+        var fprice = fkey ? (SUB_FIXINS_PRICES[fkey] || 0) : 0;
+        fixinExtra += fprice;
+        fixinMods.push({name: fixins[f], modifier_id: fid, group: "Sub Fixins", price: fprice});
+      }
+      
+      // Cheese modifier
+      var cheeseMod = null;
+      if (cheese) {
+        var ckey = resolveModifier(cheese, CHEESE_IDS);
+        var cid = ckey ? CHEESE_IDS[ckey] : null;
+        var cprice = ckey ? (CHEESE_PRICES[ckey] || 0) : 0;
+        fixinExtra += cprice;
+        cheeseMod = {name: cheese, modifier_id: cid, group: "Cheese Options", price: cprice};
+      }
+      
+      var allMods = fixinMods;
+      if (cheeseMod) allMods.push(cheeseMod);
+      
+      return res.json({
+        item_name: sizePrefix + sub.name,
+        item_id: sub.id,
+        category: "Submarines",
+        base_price: subPrice,
+        extra_charges: fixinExtra,
+        unit_price: subPrice + fixinExtra,
+        modifiers: allMods,
+        special_instructions: specialInstructions || undefined
+      });
+    }
+
+    // ── SANDWICH ──
+    if (itemType === "sandwich") {
+      var match = findMenuItem(subName || args.item_name || "");
+      if (!match) return res.json("ERROR: Sandwich not found. Say the full name like: cheeseburger, cheese fish, grilled chicken, crispy chicken, fried fish, BLT, hot dog, crab cake.");
+      
+      var sandMods = [];
+      var sandExtra = 0;
+      // Sandwich fixins from DB or hardcoded
+      var sandFixinsDB = MENU_CACHE.sandwich_fixins.length > 0 ? MENU_CACHE.sandwich_fixins : null;
+      for (var sf = 0; sf < fixins.length; sf++) {
+        var sfMatch = sandFixinsDB ? fuzzyFindInArray(fixins[sf], sandFixinsDB, "fixin_name") : null;
+        var sfid = sfMatch ? sfMatch.modifier_id : null;
+        var sfprice = sfMatch ? parseFloat(sfMatch.price || 0) : 0;
+        sandExtra += sfprice;
+        sandMods.push({name: fixins[sf], modifier_id: sfid, group: "Add Toppings", price: sfprice});
+      }
+      if (cheese) {
+        var ckey = resolveModifier(cheese, CHEESE_IDS);
+        var cid = ckey ? CHEESE_IDS[ckey] : null;
+        var cprice = ckey ? (CHEESE_PRICES[ckey] || 0) : 0;
+        sandExtra += cprice;
+        sandMods.push({name: cheese, modifier_id: cid, group: "Cheese Options", price: cprice});
+      }
+      
+      return res.json({
+        item_name: match.item_name,
+        item_id: match.pos_id,
+        category: match.category,
+        base_price: parseFloat(match.price_default || 0),
+        extra_charges: sandExtra,
+        unit_price: parseFloat(match.price_default || 0) + sandExtra,
+        modifiers: sandMods,
+        special_instructions: specialInstructions || undefined
+      });
+    }
+
+    // ── WRAP ──
+    if (itemType === "wrap") {
+      var match = findMenuItem(subName || args.item_name || "");
+      if (!match) return res.json("ERROR: Wrap not found. Say the full name like: chicken caesar, veggie, cheese steak, buffalo chicken, chipotle, turkey, tuna.");
+      
+      var wrapMods = [];
+      var wrapExtra = 0;
+      var wrapFixinsDB = MENU_CACHE.wrap_fixins.length > 0 ? MENU_CACHE.wrap_fixins : null;
+      for (var wf = 0; wf < fixins.length; wf++) {
+        var wfMatch = wrapFixinsDB ? fuzzyFindInArray(fixins[wf], wrapFixinsDB, "fixin_name") : null;
+        var wfid = wfMatch ? wfMatch.modifier_id : null;
+        var wfprice = wfMatch ? parseFloat(wfMatch.price || 0) : 0;
+        wrapExtra += wfprice;
+        wrapMods.push({name: fixins[wf], modifier_id: wfid, group: "Add Toppings", price: wfprice});
+      }
+      
+      return res.json({
+        item_name: match.item_name,
+        item_id: match.pos_id,
+        category: match.category,
+        base_price: parseFloat(match.price_default || 0),
+        extra_charges: wrapExtra,
+        unit_price: parseFloat(match.price_default || 0) + wrapExtra,
+        modifiers: wrapMods,
+        special_instructions: specialInstructions || undefined
+      });
+    }
+
+    // ── WINGS (buffalo or whole) ──
+    if (itemType === "wings" || itemType === "buffalo wings" || itemType === "whole wings") {
+      var wingName = (args.item_name || subName || "").toLowerCase();
+      var wingQty = parseInt(args.quantity || 0);
+      
+      // Find wing item by name/quantity
+      var match = null;
+      var items = MENU_CACHE.items.length > 0 ? MENU_CACHE.items : [];
+      for (var wi = 0; wi < items.length; wi++) {
+        if (items[wi].item_type === "buffalo_wings" || items[wi].item_type === "whole_wings") {
+          var kws = items[wi].keywords || [];
+          for (var wk = 0; wk < kws.length; wk++) {
+            if (wingName.indexOf(kws[wk]) !== -1) { match = items[wi]; break; }
+          }
+          if (match) break;
+        }
+      }
+      // Fallback: match by quantity
+      if (!match && wingQty > 0) {
+        var wType = (itemType === "whole wings" || wingName.indexOf("whole") !== -1) ? "whole_wings" : "buffalo_wings";
+        for (var wi2 = 0; wi2 < items.length; wi2++) {
+          if (items[wi2].item_type === wType) {
+            var numMatch = items[wi2].item_name.match(/(\d+)/);
+            if (numMatch && parseInt(numMatch[1]) === wingQty) { match = items[wi2]; break; }
+          }
+        }
+      }
+      if (!match) return res.json("ERROR: Wings not found. Buffalo: 6,9,12,18,24,36,48,50. Whole: 4,6,8,10,12,15,20,30.");
+      
+      var wingMods = [];
+      var wingExtra = 0;
+      // Flavor
+      var flavor = (args.wing_flavor || "").trim();
+      if (flavor) {
+        var flavorDB = MENU_CACHE.wing_flavors.length > 0 ? MENU_CACHE.wing_flavors : null;
+        var flMatch = flavorDB ? fuzzyFindInArray(flavor, flavorDB, "flavor_name") : null;
+        var flPrice = flMatch ? parseFloat(flMatch.price || 0) : 0;
+        wingExtra += flPrice;
+        wingMods.push({name: flavor, modifier_id: flMatch ? flMatch.modifier_id : null, group: "Wings - Flavors", price: flPrice});
+      }
+      // Dressing
+      var dressing = (args.wing_dressing || "").trim();
+      if (dressing) {
+        var dressDB = MENU_CACHE.wing_dressings.length > 0 ? MENU_CACHE.wing_dressings : null;
+        var drMatch = dressDB ? fuzzyFindInArray(dressing, dressDB, "dressing_name") : null;
+        var drPrice = drMatch ? parseFloat(drMatch.price || 0) : 0;
+        wingExtra += drPrice;
+        wingMods.push({name: dressing, modifier_id: drMatch ? drMatch.modifier_id : null, group: "Wings - Dressing", price: drPrice});
+      }
+      
+      return res.json({
+        item_name: match.item_name,
+        item_id: match.pos_id,
+        category: match.category,
+        base_price: parseFloat(match.price_default || 0),
+        extra_charges: wingExtra,
+        unit_price: parseFloat(match.price_default || 0) + wingExtra,
+        modifiers: wingMods,
+        special_instructions: specialInstructions || undefined
+      });
+    }
+
+    // ── SALAD ──
+    if (itemType === "salad") {
+      var match = findMenuItem(subName || args.item_name || "");
+      if (!match) return res.json("ERROR: Salad not found. Available: garden, grilled chicken caesar, greek, grilled chicken garden, chef's, tuna, fried shrimp.");
+      
+      var saladMods = [];
+      var saladExtra = 0;
+      var saladDress = (args.salad_dressing || "").trim();
+      if (saladDress) {
+        var sdDB = MENU_CACHE.salad_dressings.length > 0 ? MENU_CACHE.salad_dressings : null;
+        var sdMatch = sdDB ? fuzzyFindInArray(saladDress, sdDB, "dressing_name") : null;
+        var sdPrice = sdMatch ? parseFloat(sdMatch.price || 0) : 0;
+        saladExtra += sdPrice;
+        saladMods.push({name: saladDress, modifier_id: sdMatch ? sdMatch.modifier_id : null, group: "Salad Dressing", price: sdPrice});
+      }
+      // Salad extras (Group 67 in POS)
+      var SALAD_EXTRAS = {
+        "extra cheese": {id: 504, price: 2.00},
+        "extra meat": {id: 502, price: 1.99},
+        "add egg": {id: 705, price: 1.00},
+        "egg": {id: 705, price: 1.00}
+      };
+      var saladFixins = args.salad_fixins || fixins || [];
+      for (var sx = 0; sx < saladFixins.length; sx++) {
+        var sxn = saladFixins[sx].toLowerCase().trim();
+        var sxMatch = SALAD_EXTRAS[sxn] || null;
+        if (sxMatch) {
+          saladExtra += sxMatch.price;
+          saladMods.push({name: saladFixins[sx], modifier_id: sxMatch.id, group: "Add Toppings", price: sxMatch.price});
+        }
+      }
+      
+      var saladBase = parseFloat(match.price_default || 0);
+      return res.json({
+        item_name: match.item_name,
+        item_id: match.pos_id,
+        category: match.category,
+        base_price: saladBase,
+        extra_charges: saladExtra,
+        unit_price: saladBase + saladExtra,
+        modifiers: saladMods,
+        special_instructions: specialInstructions || undefined
+      });
+    }
+
+    // ── GYRO ──
+    if (itemType === "gyro") {
+      var match = findMenuItem(subName || args.item_name || "");
+      if (!match) return res.json("ERROR: Gyro not found. Available: chicken gyro, lamb gyro, chicken gyro platter, lamb gyro platter.");
+      
+      var gyroMods = [];
+      var gyroMeat = (args.gyro_meat || "").trim();
+      if (gyroMeat) {
+        var gmId = gyroMeat.toLowerCase() === "chicken" ? 697 : (gyroMeat.toLowerCase() === "lamb" ? 698 : null);
+        gyroMods.push({name: gyroMeat, modifier_id: gmId, group: "Gyro Meat", price: 0});
+      }
+      // Wrap/gyro fixins
+      var gyroExtra = 0;
+      var gyroFixinsDB = MENU_CACHE.wrap_fixins.length > 0 ? MENU_CACHE.wrap_fixins : null;
+      for (var gf = 0; gf < fixins.length; gf++) {
+        var gfMatch = gyroFixinsDB ? fuzzyFindInArray(fixins[gf], gyroFixinsDB, "fixin_name") : null;
+        var gfprice = gfMatch ? parseFloat(gfMatch.price || 0) : 0;
+        gyroExtra += gfprice;
+        gyroMods.push({name: fixins[gf], modifier_id: gfMatch ? gfMatch.modifier_id : null, group: "Add Toppings", price: gfprice});
+      }
+      
+      return res.json({
+        item_name: match.item_name,
+        item_id: match.pos_id,
+        category: match.category,
+        base_price: parseFloat(match.price_default || 0),
+        extra_charges: gyroExtra,
+        unit_price: parseFloat(match.price_default || 0) + gyroExtra,
+        modifiers: gyroMods,
+        special_instructions: specialInstructions || undefined
+      });
+    }
+
+    // ── TENDERS ──
+    if (itemType === "tenders" || itemType === "chicken tenders") {
+      var match = findMenuItem(subName || args.item_name || "");
+      if (!match) return res.json("ERROR: Tenders not found. Available: 3 piece, 5 piece, 7 piece.");
+      
+      var tenderMods = [];
+      var sauce = (args.tender_sauce || "").trim();
+      if (sauce) {
+        var tsDB = MENU_CACHE.tender_sauces.length > 0 ? MENU_CACHE.tender_sauces : null;
+        var tsMatch = tsDB ? fuzzyFindInArray(sauce, tsDB, "sauce_name") : null;
+        tenderMods.push({name: sauce, modifier_id: tsMatch ? tsMatch.modifier_id : null, group: "Tender Sauce", price: 0});
+      }
+      
+      return res.json({
+        item_name: match.item_name,
+        item_id: match.pos_id,
+        category: match.category,
+        unit_price: parseFloat(match.price_default || 0),
+        modifiers: tenderMods,
+        special_instructions: specialInstructions || undefined
+      });
+    }
+
+    // ── DRINK / SODA ──
+    if (itemType === "drink" || itemType === "beverage" || itemType === "soda") {
+      var match = findMenuItem(subName || args.item_name || "");
+      if (!match) return res.json("ERROR: Drink not found. Available: can soda, 2 liter soda, water, lemonade, apple juice, orange juice, cranberry juice.");
+      
+      var drinkMods = [];
+      var sodaFl = (args.soda_flavor || "").trim();
+      if (sodaFl) {
+        var sfDB = MENU_CACHE.soda_flavors.length > 0 ? MENU_CACHE.soda_flavors : null;
+        var sfMatch = sfDB ? fuzzyFindInArray(sodaFl, sfDB, "flavor_name") : null;
+        drinkMods.push({name: sodaFl, modifier_id: sfMatch ? sfMatch.modifier_id : null, group: "Soda Can", price: 0});
+      }
+      
+      return res.json({
+        item_name: match.item_name,
+        item_id: match.pos_id,
+        category: match.category,
+        unit_price: parseFloat(match.price_default || 0),
+        modifiers: drinkMods,
+        special_instructions: specialInstructions || undefined
+      });
+    }
+
+    // ── STROMBOLI (uses 12" pizza topping prices) ──
+    if (itemType === "stromboli") {
+      var match = findMenuItem(subName || args.item_name || "");
+      if (!match) return res.json("ERROR: Stromboli not found. Available: Regular Cheese and Beef, Veggie, Philly Cheese Steak, Chicken.");
+      
+      var stBase = parseFloat(match.price_default || 0);
+      var stResult = buildModifiers(toppings, 12, 0);
+      return res.json({
+        item_name: match.item_name,
+        item_id: match.pos_id,
+        category: "Stromboli",
+        base_price: stBase,
+        topping_charges: stResult.extra_charge,
+        unit_price: stBase + stResult.extra_charge,
+        modifiers: stResult.modifiers,
+        special_instructions: specialInstructions || undefined
+      });
+    }
+
+    // ── QUESADILLA (uses 12" pizza topping prices) ──
+    if (itemType === "quesadilla") {
+      var match = findMenuItem(subName || args.item_name || "");
+      if (!match) return res.json("ERROR: Quesadilla not found. Available: Chicken Breast, Buffalo Chicken, Steak, Veggie, Shrimp.");
+      
+      var qBase = parseFloat(match.price_default || 0);
+      var qResult = buildModifiers(toppings, 12, 0);
+      return res.json({
+        item_name: match.item_name,
+        item_id: match.pos_id,
+        category: match.category,
+        base_price: qBase,
+        topping_charges: qResult.extra_charge,
+        unit_price: qBase + qResult.extra_charge,
+        modifiers: qResult.modifiers,
+        special_instructions: specialInstructions || undefined
+      });
+    }
+
+    // ── GENERIC LOOKUP (sides, desserts, pasta, clubs, nuggets, seafood, platters) ──
+    var match = findMenuItem(subName || args.item_name || itemType);
+    if (match) {
+      return res.json({
+        item_name: match.item_name,
+        item_id: match.pos_id,
+        category: match.category,
+        unit_price: parseFloat(match.price_default || match.price_8 || match.price_10 || 0),
+        modifiers: [],
+        special_instructions: specialInstructions || undefined
+      });
+    }
+
+    return res.json("ERROR: Item not found. Tell me the exact item name.");
+  } catch (e) {
+    console.error("calculate_price error:", e);
+    return res.json("ERROR: " + e.message);
+  }
+});
+
+// ═══════════════════════════════════════════════════
+// TOOL 2: calculate_combo — for combo deals
+// Handles all topping math, free topping rules, ID lookups
+// ═══════════════════════════════════════════════════
+app.post("/retell/function/calculate_combo", function (req, res) {
+  try {
+    var args = req.body.args || req.body;
+    var dealType = (args.deal_type || "").toLowerCase().trim();
+    var pizzaSize = parseInt(args.pizza_size || 0);
+    var pizzas = args.pizzas || []; // [{toppings:[{name,half}]}]
+    var subName = (args.sub_name || "").trim();
+    var subSize = (args.sub_size || "half").toLowerCase();
+    var subFixins = args.sub_fixins || [];
+    var subCheese = (args.sub_cheese || "").trim();
+    var subSpecial = (args.sub_special_instructions || "").trim();
+    var wingFlavor = (args.wing_flavor || "").trim();
+    var wingDressing = (args.wing_dressing || "").trim();
+    var sodaFlavor = (args.soda_flavor || "").trim();
+    var sodaFlavor2 = (args.soda_flavor_2 || "").trim();
+    var twoLiterFlavor = (args.two_liter_flavor || "").trim();
+    var friesUpgrade = (args.fries_upgrade || "").toLowerCase().trim();
+
+    // Special/premium subs NOT allowed in pizza+sub, combo deal, or wings+sub deals
+    var PREMIUM_SUB_IDS = [723, 724, 725, 726, 710];
+    var PREMIUM_EXCLUDED_DEALS = ["pizza and sub", "pizza sub combo", "combo deal", "pizza sub wings", "wings and sub", "wings sub combo"];
+    if (subName && PREMIUM_EXCLUDED_DEALS.indexOf(dealType) !== -1) {
+      var premCheck = matchSub(subName);
+      if (premCheck && PREMIUM_SUB_IDS.indexOf(premCheck.id) !== -1) {
+        return res.json("ERROR: " + premCheck.name + " is a premium sub and cannot be used in " + dealType + ". Only regular subs qualify. This sub can be made into a Sub Combo (sub + fries + can soda) instead. Use deal_type 'sub combo'.");
+      }
+    }
+
+    // Find deal
+    var deal = COMBO_DB[dealType];
+    if (!deal) {
+      var available = Object.keys(COMBO_DB).join(", ");
+      return res.json("ERROR: Deal not found. Available deals: " + available);
+    }
+
+    // Find size entry
+    var sizeKey = pizzaSize || (subSize === "whole" || subSize === "12" ? 12 : 8);
+    if (dealType.indexOf("sub combo") !== -1 && !pizzaSize) sizeKey = (subSize === "whole" || subSize === "12") ? 12 : 8;
+    if (!pizzaSize && deal.pizzas === 0 && deal.sizes[0]) sizeKey = 0;
+    
+    var sizeEntry = deal.sizes[sizeKey] || deal.sizes[pizzaSize];
+    if (!sizeEntry) {
+      var availSizes = Object.keys(deal.sizes).join(", ");
+      return res.json("ERROR: Size " + sizeKey + " not available for " + dealType + ". Available sizes: " + availSizes);
+    }
+
+    var basePrice = sizeEntry.price;
+    var dealId = sizeEntry.id;
+    var totalExtra = 0;
+    var components = [];
+    var freeToppings = deal.freeToppings || 0;
+
+    // ── Build pizza components ──
+    var pizzaIds = {10:735, 12:736, 14:737, 16:738, 18:739};
+    var sizeLabels = {10:"Sm",12:"Med",14:"Lrg",16:"XL",18:"XXL"};
+    
+    for (var p = 0; p < pizzas.length; p++) {
+      var pizzaToppings = pizzas[p].toppings || [];
+      var pizzaSpecial = pizzas[p].special_instructions || "";
+      var result = buildModifiers(pizzaToppings, pizzaSize, freeToppings);
+      totalExtra += result.extra_charge;
+      
+      var comp = {
+        component_name: pizzaSize + " inch " + (sizeLabels[pizzaSize]||"") + " Cheese Pizza",
+        item_id: String(pizzaIds[pizzaSize] || 737),
+        category: "Pizzas",
+        modifiers: result.modifiers
+      };
+      if (pizzaSpecial) comp.special_instructions = pizzaSpecial;
+      components.push(comp);
+    }
+
+    // ── Build sub component ──
+    if (subName) {
+      var sub = matchSub(subName);
+      if (!sub) return res.json("ERROR: Sub not found: " + subName + ". Check spelling. Available: cheese steak, shrimp cheese steak, philly cheese steak, italian cold cut, turkey breast, etc.");
+      
+      var is12 = (subSize === "whole" || subSize === "12");
+      var prefix = is12 ? "12 inch Whole " : "8 inch Half ";
+      var subMods = [];
+      var subExtra = 0;
+      
+      for (var sf = 0; sf < subFixins.length; sf++) {
+        var sfkey = resolveModifier(subFixins[sf], SUB_FIXINS_IDS);
+        var sfid = sfkey ? SUB_FIXINS_IDS[sfkey] : null;
+        var sfprice = sfkey ? (SUB_FIXINS_PRICES[sfkey] || 0) : 0;
+        subExtra += sfprice;
+        subMods.push({name: subFixins[sf], modifier_id: sfid, group: "Sub Fixins", price: sfprice});
+      }
+      if (subCheese) {
+        var sckey = resolveModifier(subCheese, CHEESE_IDS);
+        var scid = sckey ? CHEESE_IDS[sckey] : null;
+        var scprice = sckey ? (CHEESE_PRICES[sckey] || 0) : 0;
+        subExtra += scprice;
+        subMods.push({name: subCheese, modifier_id: scid, group: "Cheese Options", price: scprice});
+      }
+      totalExtra += subExtra;
+      
+      var subComp = {
+        component_name: prefix + sub.name,
+        item_id: String(sub.id),
+        category: "Submarines",
+        modifiers: subMods
+      };
+      if (subSpecial) subComp.special_instructions = subSpecial;
+      components.push(subComp);
+    }
+
+    // ── Build wings component ──
+    if (wingFlavor) {
+      var wingCount = deal.wings || (dealType.indexOf("combo deal") !== -1 ? (pizzaSize <= 12 ? 6 : 8) : 0);
+      if (dealType.indexOf("wings and sub") !== -1) wingCount = 6;
+      if (dealType.indexOf("wings special buffalo") !== -1) wingCount = 6;
+      if (dealType.indexOf("wings special whole") !== -1) wingCount = 4;
+      if (dealType.indexOf("chicken box whole") !== -1) wingCount = 4;
+      if (dealType.indexOf("chicken box buffalo") !== -1) wingCount = 6;
+      
+      var wingIds = {6:579,8:580,9:580,10:581,12:581,48:585};
+      var wholeIds = {4:591,6:592};
+      var isWhole = dealType.indexOf("whole") !== -1;
+      var wid = isWhole ? (wholeIds[wingCount] || 591) : (wingIds[wingCount] || 579);
+      var wType = isWhole ? "Whole" : "Buffalo";
+      
+      var wingMods = [{name: wingFlavor, group: "Wings - Flavors", price: 0}];
+      if (wingDressing) wingMods.push({name: wingDressing, group: "Wings - Dressing", price: 0});
+      
+      components.push({
+        component_name: wingCount + "pcs " + wType + " wings",
+        item_id: String(wid),
+        category: "Wings",
+        modifiers: wingMods
+      });
+    }
+
+    // ── Build fries component ──
+    if (deal.includes_fries) {
+      var FRIES_UPGRADES = {
+        "western fries": {name:"Western Fries Large", id:"608"},
+        "western": {name:"Western Fries Large", id:"608"},
+        "cheese fries": {name:"Fries with Cheese", id:"811"},
+        "fries with cheese": {name:"Fries with Cheese", id:"811"},
+        "nacho fries": {name:"Fries with Nacho", id:"611"},
+        "fries with nacho": {name:"Fries with Nacho", id:"611"},
+        "gravy fries": {name:"Fries with Gravy", id:"609"},
+        "fries with gravy": {name:"Fries with Gravy", id:"609"},
+        "mozzarella fries": {name:"Fries with Mozzarella", id:"612"},
+        "fries with mozzarella": {name:"Fries with Mozzarella", id:"612"},
+        "pizza fries": {name:"Pizza Fries", id:"615"},
+        "crazy fries": {name:"Crazy Fries", id:"613"},
+        "large fries": {name:"Large French Fries", id:"830"}
+      };
+      if (friesUpgrade && FRIES_UPGRADES[friesUpgrade]) {
+        var upgrade = FRIES_UPGRADES[friesUpgrade];
+        totalExtra += 2.00;
+        components.push({component_name: upgrade.name + " +$2.00 upgrade", item_id: upgrade.id, category: "Sides"});
+      } else {
+        components.push({component_name: "French Fries", item_id: "607", category: "Sides"});
+      }
+    }
+
+    // ── Build soda components ──
+    if (deal.includes_can || sodaFlavor) {
+      if (sodaFlavor) {
+        var sodaMods = [{name: sodaFlavor, group: "Soda Can", price: 0}];
+        components.push({component_name: "Can Soda", item_id: "728", category: "Beverages", modifiers: sodaMods});
+      }
+      if (sodaFlavor2) {
+        var sodaMods2 = [{name: sodaFlavor2, group: "Soda Can", price: 0}];
+        components.push({component_name: "Can Soda", item_id: "728", category: "Beverages", modifiers: sodaMods2});
+      }
+    }
+    if (deal.includes_2l || twoLiterFlavor) {
+      if (twoLiterFlavor) {
+        var tlMods = [{name: twoLiterFlavor, group: "Soda Can", price: 0}];
+        components.push({component_name: "2 Liter Soda", item_id: "790", category: "Beverages", modifiers: tlMods});
+      }
+    }
+
+    // ── Burger/Fish combo ──
+    if (dealType === "burger combo") {
+      components.push({component_name: "Cheese Burger Sandwich", item_id: "713", category: "Sandwiches", modifiers: []});
+      components.push({component_name: "French Fries", item_id: "607", category: "Sides"});
+      if (sodaFlavor) components.push({component_name: "Can Soda", item_id: "728", category: "Beverages", modifiers: [{name:sodaFlavor,group:"Soda Can",price:0}]});
+    }
+    if (dealType === "fish combo") {
+      components.push({component_name: "Cheese Fish Sandwich", item_id: "718", category: "Sandwiches", modifiers: []});
+      components.push({component_name: "French Fries", item_id: "607", category: "Sides"});
+      if (sodaFlavor) components.push({component_name: "Can Soda", item_id: "728", category: "Beverages", modifiers: [{name:sodaFlavor,group:"Soda Can",price:0}]});
+    }
+
+    var unitPrice = Math.round((basePrice + totalExtra) * 100) / 100;
+
+    // Build proper item_name for POS display
+    var DEAL_DISPLAY_NAMES = {
+      "double deal": "Double Deal",
+      "3 pizza special": "3-Pizza Special",
+      "three pizza special": "3-Pizza Special",
+      "pizza and wings": "Pizza and Wings Deal",
+      "family deal": "Pizza and Wings Deal",
+      "pizza and sub": "Pizza and Sub Combo",
+      "pizza sub combo": "Pizza and Sub Combo",
+      "combo deal": "Combo Deal",
+      "pizza sub wings": "Combo Deal",
+      "sub combo": "Sub Combo",
+      "2 sub combo": "2 Sub Combo",
+      "two sub combo": "2 Sub Combo",
+      "3 sub combo": "3 Sub Combo",
+      "three sub combo": "3 Sub Combo",
+      "wings and sub": "Wings and Sub Combo",
+      "wings sub combo": "Wings and Sub Combo",
+      "wings special buffalo": "Buffalo Wings Special",
+      "wings special whole": "Whole Wings Special",
+      "chicken box whole": "Chicken Box",
+      "chicken box buffalo": "Chicken Box",
+      "burger combo": "Burger Combo",
+      "fish combo": "Fish Combo",
+      "party deal": "Party Deal",
+      "fish and wings deal": "Fish and Wings Deal"
+    };
+    var displayName = DEAL_DISPLAY_NAMES[dealType] || dealType;
+    if (pizzaSize) displayName += " " + pizzaSize + " inch";
+    if (dealType.indexOf("sub combo") !== -1 && !pizzaSize) {
+      var subSizeLabel = (subSize === "whole" || subSize === "12") ? "12 inch" : "8 inch";
+      displayName += " " + subSizeLabel;
+    }
+
+    // Build breakdown text for agent to read
+    var breakdown = "Base deal price: $" + basePrice.toFixed(2);
+    if (totalExtra > 0) breakdown += " + extra charges: $" + totalExtra.toFixed(2);
+    breakdown += " = Total: $" + unitPrice.toFixed(2);
+
+    return res.json({
+      item_name: displayName,
+      deal_name: dealType,
+      deal_id: dealId,
+      base_price: basePrice,
+      extra_charges: totalExtra,
+      unit_price: unitPrice,
+      components: components,
+      breakdown: breakdown,
+      tax: Math.round(unitPrice * CONFIG.TAX_RATE * 100) / 100,
+      total_with_tax: Math.round(unitPrice * (1 + CONFIG.TAX_RATE) * 100) / 100
+    });
+
+  } catch (e) {
+    console.error("calculate_combo error:", e);
+    return res.json("ERROR: " + e.message);
+  }
+});
+
+// ═══ DATABASE MANAGEMENT ENDPOINTS ═══
 app.get("/reload-menu", async function (req, res) {
-  var ok = await loadMenu();
-  res.json({
-    success: ok, source: MENU_CACHE.loaded_from,
-    deals: Object.keys(MENU.deals).length, subs: MENU.subs.length,
-    specialty: MENU.specialty.length, sides: MENU.sides.length
+  var ok = await loadMenuFromDB();
+  res.json({ reloaded: ok, status: DB_STATUS, loaded_from: MENU_CACHE.loaded_from, loaded_at: MENU_CACHE.loaded_at,
+    counts: { items: MENU_CACHE.items.length, toppings: MENU_CACHE.toppings.length, deals: MENU_CACHE.combo_deals.length }
   });
 });
 
-app.get("/health", function (req, res) {
+app.get("/test-db", function (req, res) {
   res.json({
-    status: "ok",
-    menu_loaded: MENU.loaded,
-    db_status: DB_STATUS,
-    loaded_from: MENU_CACHE.loaded_from,
-    loaded_at: MENU_CACHE.loaded_at,
-    counts: MENU_CACHE.counts || { subs: MENU.subs.length, deals: Object.keys(MENU.deals).length, specialty: MENU.specialty.length },
-    active_sessions: Object.keys(SESSIONS).length,
-    version: "2.1-db"
-  });
-});
-
-app.get("/test-db", async function (req, res) {
-  var result = {
     db_status: DB_STATUS,
     loaded_from: MENU_CACHE.loaded_from,
     loaded_at: MENU_CACHE.loaded_at,
     counts: {
-      items: 0, toppings: 0, sub_fixins: Object.keys(MENU.sub_fixins).length,
-      cheese_options: Object.keys(MENU.cheese_options).length,
-      wing_flavors: Object.keys(MENU.wing_flavors).length,
-      soda_flavors: Object.keys(MENU.soda_flavors).length,
-      combo_deals: Object.keys(MENU.deals).length
+      items: MENU_CACHE.items.length,
+      toppings: MENU_CACHE.toppings.length,
+      sub_fixins: MENU_CACHE.sub_fixins.length,
+      cheese_options: MENU_CACHE.cheese_options.length,
+      wing_flavors: MENU_CACHE.wing_flavors.length,
+      soda_flavors: MENU_CACHE.soda_flavors.length,
+      combo_deals: MENU_CACHE.combo_deals.length
     },
-    sample_sub: MENU.subs.slice(0, 3).map(function(s) { return s.name + " [" + s.id + "] $" + s.p8; }),
-    sample_deal: Object.keys(MENU.deals).slice(0, 3)
-  };
-  // Count total items across all categories
-  var allLists = [MENU.pizzas,MENU.specialty,MENU.subs,MENU.sandwiches,MENU.wraps,MENU.clubs,
-    MENU.buffalo_wings,MENU.whole_wings,MENU.nuggets,MENU.fish_nuggets,MENU.tenders,
-    MENU.salads,MENU.gyros,MENU.pasta,MENU.stromboli,MENU.quesadillas,
-    MENU.seafood,MENU.platters,MENU.sides,MENU.desserts,MENU.beverages];
-  for (var i = 0; i < allLists.length; i++) result.counts.items += allLists[i].length;
-  res.json(result);
-});
-
-app.get("/sessions", function (req, res) {
-  var sessions = Object.values(SESSIONS).map(function (s) {
-    return { id: s.id, state: s.state, basket: s.basket.length, total: s.total, age: Math.round((Date.now() - s.created) / 1000) + "s" };
-  });
-  res.json(sessions);
-});
-
-// ═══════════════════════════════════════════════════════════════
-// START
-// ═══════════════════════════════════════════════════════════════
-var PORT = process.env.PORT || 3000;
-loadMenu().then(function () {
-  app.listen(PORT, function () {
-    console.log("Demo Pizza Orchestrator v2.0 running on port " + PORT);
+    sample_sub: SUBS_DB.slice(0, 3).map(function(s) { return s.name + " [" + s.id + "] $" + s.p8; }),
+    sample_deal: Object.keys(COMBO_DB).slice(0, 3)
   });
 });
+
+app.listen(CONFIG.PORT, function () { console.log("V16 POS Bridge | Port: " + CONFIG.PORT + " | ID: " + CONFIG.RESTAURANT_ID + " | DB: " + DB_STATUS); });
