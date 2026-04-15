@@ -1585,7 +1585,7 @@ function buildModifiers(toppings, size, freeToppingsCount) {
 }
 
 // Generic menu item search — matches by keywords, longest match first
-function findMenuItem(input) {
+function findMenuItem(input, filterCategory) {
   var nm = (input || "").toLowerCase().replace(/[^a-z0-9 ]/g, "").trim();
   if (!nm) return null;
   
@@ -1594,6 +1594,7 @@ function findMenuItem(input) {
   var bestLen = 0;
   
   for (var i = 0; i < items.length; i++) {
+    if (filterCategory && (items[i].category || "").toLowerCase() !== filterCategory.toLowerCase()) continue;
     var kws = items[i].keywords || [];
     for (var k = 0; k < kws.length; k++) {
       if (nm.indexOf(kws[k]) !== -1 && kws[k].length > bestLen) {
@@ -1731,7 +1732,7 @@ app.post("/retell/function/calculate_price", function (req, res) {
 
     // ── SANDWICH ──
     if (itemType === "sandwich") {
-      var match = findMenuItem(subName || args.item_name || "");
+      var match = findMenuItem(subName || args.item_name || "", "Sandwiches");
       if (!match) return res.json("ERROR: Sandwich not found. Say the full name like: cheeseburger, cheese fish, grilled chicken, crispy chicken, fried fish, BLT, hot dog, crab cake.");
       
       var sandMods = [];
@@ -1767,7 +1768,7 @@ app.post("/retell/function/calculate_price", function (req, res) {
 
     // ── WRAP ──
     if (itemType === "wrap") {
-      var match = findMenuItem(subName || args.item_name || "");
+      var match = findMenuItem(subName || args.item_name || "", "Wraps");
       if (!match) return res.json("ERROR: Wrap not found. Say the full name like: chicken caesar, veggie, cheese steak, buffalo chicken, chipotle, turkey, tuna.");
       
       var wrapMods = [];
@@ -1857,7 +1858,7 @@ app.post("/retell/function/calculate_price", function (req, res) {
 
     // ── SALAD ──
     if (itemType === "salad") {
-      var match = findMenuItem(subName || args.item_name || "");
+      var match = findMenuItem(subName || args.item_name || "", "Salads");
       if (!match) return res.json("ERROR: Salad not found. Available: garden, grilled chicken caesar, greek, grilled chicken garden, chef's, tuna, fried shrimp.");
       
       var saladMods = [];
@@ -1902,7 +1903,7 @@ app.post("/retell/function/calculate_price", function (req, res) {
 
     // ── GYRO ──
     if (itemType === "gyro") {
-      var match = findMenuItem(subName || args.item_name || "");
+      var match = findMenuItem(subName || args.item_name || "", "Gyros");
       if (!match) return res.json("ERROR: Gyro not found. Available: chicken gyro, lamb gyro, chicken gyro platter, lamb gyro platter.");
       
       var gyroMods = [];
@@ -1935,7 +1936,8 @@ app.post("/retell/function/calculate_price", function (req, res) {
 
     // ── TENDERS ──
     if (itemType === "tenders" || itemType === "chicken tenders") {
-      var match = findMenuItem(subName || args.item_name || "");
+      var match = findMenuItem(subName || args.item_name || "", "Tenders");
+      if (!match) match = findMenuItem(subName || args.item_name || "");
       if (!match) return res.json("ERROR: Tenders not found. Available: 3 piece, 5 piece, 7 piece.");
       
       var tenderMods = [];
@@ -1958,7 +1960,7 @@ app.post("/retell/function/calculate_price", function (req, res) {
 
     // ── DRINK / SODA ──
     if (itemType === "drink" || itemType === "beverage" || itemType === "soda") {
-      var match = findMenuItem(subName || args.item_name || "");
+      var match = findMenuItem(subName || args.item_name || "", "Beverages");
       if (!match) return res.json("ERROR: Drink not found. Available: can soda, 2 liter soda, water, lemonade, apple juice, orange juice, cranberry juice.");
       
       var drinkMods = [];
@@ -1981,7 +1983,7 @@ app.post("/retell/function/calculate_price", function (req, res) {
 
     // ── STROMBOLI (uses 12" pizza topping prices) ──
     if (itemType === "stromboli") {
-      var match = findMenuItem(subName || args.item_name || "");
+      var match = findMenuItem(subName || args.item_name || "", "Stromboli");
       if (!match) return res.json("ERROR: Stromboli not found. Available: Regular Cheese and Beef, Veggie, Philly Cheese Steak, Chicken.");
       
       var stBase = parseFloat(match.price_default || 0);
@@ -2000,7 +2002,7 @@ app.post("/retell/function/calculate_price", function (req, res) {
 
     // ── QUESADILLA (uses 12" pizza topping prices) ──
     if (itemType === "quesadilla") {
-      var match = findMenuItem(subName || args.item_name || "");
+      var match = findMenuItem(subName || args.item_name || "", "Quesadillas");
       if (!match) return res.json("ERROR: Quesadilla not found. Available: Chicken Breast, Buffalo Chicken, Steak, Veggie, Shrimp.");
       
       var qBase = parseFloat(match.price_default || 0);
