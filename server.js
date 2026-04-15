@@ -2152,8 +2152,8 @@ app.post("/retell/function/calculate_combo", function (req, res) {
 
     // ── Build additional sub components (for 2/3 sub combos) ──
     var extraSubs = [
-      {name: data.sub_name_2, fixins: data.sub_fixins_2 || [], cheese: data.sub_cheese_2 || "", special: data.sub_special_instructions_2 || ""},
-      {name: data.sub_name_3, fixins: data.sub_fixins_3 || [], cheese: data.sub_cheese_3 || "", special: data.sub_special_instructions_3 || ""}
+      {name: args.sub_name_2, fixins: args.sub_fixins_2 || [], cheese: args.sub_cheese_2 || "", special: args.sub_special_instructions_2 || ""},
+      {name: args.sub_name_3, fixins: args.sub_fixins_3 || [], cheese: args.sub_cheese_3 || "", special: args.sub_special_instructions_3 || ""}
     ];
     for (var es = 0; es < extraSubs.length; es++) {
       if (!extraSubs[es].name) continue;
