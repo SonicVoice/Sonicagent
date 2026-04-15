@@ -1620,6 +1620,7 @@ app.post("/retell/function/calculate_price", function (req, res) {
     var itemType = (args.item_type || "").toLowerCase().trim();
     var size = parseInt(args.size || 0);
     var toppings = args.toppings || [];
+    var orderType = (args.order_type || "").toLowerCase().trim();
     var subName = (args.sub_name || args.item_name || "").trim();
     var subSize = (args.sub_size || "half").toLowerCase();
     var fixins = args.fixins || [];
@@ -1669,7 +1670,58 @@ app.post("/retell/function/calculate_price", function (req, res) {
       // Cheese pizza — use DB prices if available
       var cheesePizzaDB = MENU_CACHE.items.find(function(i) { return i.item_type === "cheese_pizza"; });
       var basePrice = cheesePizzaDB ? parseFloat(cheesePizzaDB["price_" + size] || pizzaPrices[size]) : pizzaPrices[size];
-      var result = buildModifiers(toppings, size, 0); // 0 free toppings for regular pizza
+      var freeTops = 0;
+      var isPickupSpecial = false;
+      
+      // ── PICKUP SPECIALS ──
+      if (orderType === "pickup") {
+        var pickupPrices = {10:8.49, 12:8.99, 14:9.99, 16:10.99};
+        var pickupToppingRates = {10:1.50, 12:1.00, 14:1.50, 16:2.00, 18:2.00};
+        var pickupFreeTops = {10:1, 12:0, 14:0, 16:0, 18:0};
+        if (pickupPrices[size] !== undefined) {
+          basePrice = pickupPrices[size];
+          freeTops = pickupFreeTops[size] || 0;
+          isPickupSpecial = true;
+          // Build modifiers with pickup topping rate
+          var pickupRate = pickupToppingRates[size];
+          var pickupMods = [];
+          var pickupExtra = 0;
+          var chargeCount = 0;
+          for (var pt = 0; pt < toppings.length; pt++) {
+            var topObj = typeof toppings[pt] === "string" ? {name:toppings[pt]} : toppings[pt];
+            var topName = (topObj.name || "").trim();
+            if (!topName) continue;
+            var isHalf = !!topObj.half;
+            var norm = normTopping(topName);
+            var normAlias = TOPPING_ALIASES[norm] || norm;
+            if (FREE_TOPPINGS.indexOf(norm) !== -1 || FREE_TOPPINGS.indexOf(normAlias) !== -1) {
+              pickupMods.push({name:topName, modifier_id:getToppingId(topName,size), group:"Add Toppings", price:0, charge:0});
+              continue;
+            }
+            chargeCount++;
+            var isFree = chargeCount <= freeTops;
+            var tprice = isFree ? 0 : (isHalf ? pickupRate / 2 : pickupRate);
+            tprice = Math.round(tprice * 100) / 100;
+            pickupExtra += tprice;
+            var dName = isHalf ? topName + " (Half)" : topName;
+            pickupMods.push({name:dName, modifier_id:getToppingId(topName,size), group:"Add Toppings", price:tprice, charge:tprice});
+          }
+          var unitPrice = Math.round((basePrice + pickupExtra) * 100) / 100;
+          return res.json({
+            item_name: size + " inch " + sizeLabels[size] + " Cheese Pizza",
+            item_id: pizzaIds[size],
+            category: "Pizzas",
+            base_price: basePrice,
+            topping_charges: pickupExtra,
+            unit_price: unitPrice,
+            modifiers: pickupMods,
+            pickup_special: true,
+            special_instructions: specialInstructions || undefined
+          });
+        }
+      }
+      
+      var result = buildModifiers(toppings, size, freeTops);
       var unitPrice = basePrice + result.extra_charge;
       
       return res.json({
@@ -2061,6 +2113,7 @@ app.post("/retell/function/calculate_combo", function (req, res) {
     var sodaFlavor3 = (args.soda_flavor_3 || "").trim();
     var twoLiterFlavor = (args.two_liter_flavor || "").trim();
     var friesUpgrade = (args.fries_upgrade || "").toLowerCase().trim();
+    var friesInstructions = (args.fries_instructions || "").trim();
 
     // Special/premium subs NOT allowed in pizza+sub, combo deal, or wings+sub deals
     var PREMIUM_SUB_IDS = [723, 724, 725, 726, 710];
@@ -2229,9 +2282,13 @@ app.post("/retell/function/calculate_combo", function (req, res) {
       if (friesUpgrade && FRIES_UPGRADES[friesUpgrade]) {
         var upgrade = FRIES_UPGRADES[friesUpgrade];
         totalExtra += 2.00;
-        components.push({component_name: upgrade.name + " +$2.00 upgrade", item_id: upgrade.id, category: "Sides"});
+        var friesComp = {component_name: upgrade.name + " +$2.00 upgrade", item_id: upgrade.id, category: "Sides"};
+        if (friesInstructions) friesComp.special_instructions = friesInstructions;
+        components.push(friesComp);
       } else {
-        components.push({component_name: "French Fries", item_id: "607", category: "Sides"});
+        var friesComp = {component_name: "French Fries", item_id: "607", category: "Sides"};
+        if (friesInstructions) friesComp.special_instructions = friesInstructions;
+        components.push(friesComp);
       }
       // Multi-sub combos: add extra fries (2 sub = 2 fries, 3 sub = 3 fries)
       var sc = deal.sub_count || 1;
@@ -2239,9 +2296,13 @@ app.post("/retell/function/calculate_combo", function (req, res) {
         if (friesUpgrade && FRIES_UPGRADES[friesUpgrade]) {
           var uf = FRIES_UPGRADES[friesUpgrade];
           totalExtra += 2.00;
-          components.push({component_name: uf.name + " +$2.00 upgrade", item_id: uf.id, category: "Sides"});
+          var efComp = {component_name: uf.name + " +$2.00 upgrade", item_id: uf.id, category: "Sides"};
+          if (friesInstructions) efComp.special_instructions = friesInstructions;
+          components.push(efComp);
         } else {
-          components.push({component_name: "French Fries", item_id: "607", category: "Sides"});
+          var efComp = {component_name: "French Fries", item_id: "607", category: "Sides"};
+          if (friesInstructions) efComp.special_instructions = friesInstructions;
+          components.push(efComp);
         }
       }
     }
@@ -2271,12 +2332,16 @@ app.post("/retell/function/calculate_combo", function (req, res) {
     // ── Burger/Fish combo ──
     if (dealType === "burger combo") {
       components.push({component_name: "Cheese Burger Sandwich", item_id: "713", category: "Sandwiches", modifiers: []});
-      components.push({component_name: "French Fries", item_id: "607", category: "Sides"});
+      var bfComp = {component_name: "French Fries", item_id: "607", category: "Sides"};
+      if (friesInstructions) bfComp.special_instructions = friesInstructions;
+      components.push(bfComp);
       if (sodaFlavor) components.push({component_name: "Can Soda", item_id: "728", category: "Beverages", modifiers: [{name:sodaFlavor,group:"Soda Can",price:0}]});
     }
     if (dealType === "fish combo") {
       components.push({component_name: "Cheese Fish Sandwich", item_id: "718", category: "Sandwiches", modifiers: []});
-      components.push({component_name: "French Fries", item_id: "607", category: "Sides"});
+      var ffComp = {component_name: "French Fries", item_id: "607", category: "Sides"};
+      if (friesInstructions) ffComp.special_instructions = friesInstructions;
+      components.push(ffComp);
       if (sodaFlavor) components.push({component_name: "Can Soda", item_id: "728", category: "Beverages", modifiers: [{name:sodaFlavor,group:"Soda Can",price:0}]});
     }
 
