@@ -1787,7 +1787,7 @@ app.post("/retell/function/calculate_price", function (req, res) {
 
     // ── SANDWICH ──
     if (itemType === "sandwich") {
-      var match = findMenuItem(subName || args.item_name || "", "Sandwiches");
+      var match = findMenuItem(subName || args.item_name || "", "Sandwiches") || findMenuItem(subName || args.item_name || "", "Sandwich") || findMenuItem(subName || args.item_name || "");
       if (!match) return res.json("ERROR: Sandwich not found. Say the full name like: cheeseburger, cheese fish, grilled chicken, crispy chicken, fried fish, BLT, hot dog, crab cake.");
       
       var sandMods = [];
@@ -1823,7 +1823,7 @@ app.post("/retell/function/calculate_price", function (req, res) {
 
     // ── WRAP ──
     if (itemType === "wrap") {
-      var match = findMenuItem(subName || args.item_name || "", "Wraps");
+      var match = findMenuItem(subName || args.item_name || "", "Wraps") || findMenuItem(subName || args.item_name || "", "Wrap") || findMenuItem(subName || args.item_name || "");
       if (!match) return res.json("ERROR: Wrap not found. Say the full name like: chicken caesar, veggie, cheese steak, buffalo chicken, chipotle, turkey, tuna.");
       
       var wrapMods = [];
@@ -2015,7 +2015,7 @@ app.post("/retell/function/calculate_price", function (req, res) {
 
     // ── DRINK / SODA ──
     if (itemType === "drink" || itemType === "beverage" || itemType === "soda") {
-      var match = findMenuItem(subName || args.item_name || "", "Beverages");
+      var match = findMenuItem(subName || args.item_name || "", "Beverages") || findMenuItem(subName || args.item_name || "", "Beverage") || findMenuItem(subName || args.item_name || "", "Drinks") || findMenuItem(subName || args.item_name || "");
       if (!match) return res.json("ERROR: Drink not found. Available: can soda, 2 liter soda, water, lemonade, apple juice, orange juice, cranberry juice.");
       
       var drinkMods = [];
