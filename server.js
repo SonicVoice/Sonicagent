@@ -1913,7 +1913,7 @@ app.post("/retell/function/calculate_price", function (req, res) {
 
     // ── SALAD ──
     if (itemType === "salad") {
-      var match = findMenuItem(subName || args.item_name || "", "Salads");
+      var match = findMenuItem(subName || args.item_name || "", "Salads") || findMenuItem(subName || args.item_name || "", "Salad") || findMenuItem(subName || args.item_name || "");
       if (!match) return res.json("ERROR: Salad not found. Available: garden, grilled chicken caesar, greek, grilled chicken garden, chef's, tuna, fried shrimp.");
       
       var saladMods = [];
@@ -1958,7 +1958,7 @@ app.post("/retell/function/calculate_price", function (req, res) {
 
     // ── GYRO ──
     if (itemType === "gyro") {
-      var match = findMenuItem(subName || args.item_name || "", "Gyros");
+      var match = findMenuItem(subName || args.item_name || "", "Gyros") || findMenuItem(subName || args.item_name || "", "Gyro") || findMenuItem(subName || args.item_name || "");
       if (!match) return res.json("ERROR: Gyro not found. Available: chicken gyro, lamb gyro, chicken gyro platter, lamb gyro platter.");
       
       var gyroMods = [];
@@ -2038,7 +2038,7 @@ app.post("/retell/function/calculate_price", function (req, res) {
 
     // ── STROMBOLI (uses 12" pizza topping prices) ──
     if (itemType === "stromboli") {
-      var match = findMenuItem(subName || args.item_name || "", "Stromboli");
+      var match = findMenuItem(subName || args.item_name || "", "Stromboli") || findMenuItem(subName || args.item_name || "", "Strombolis") || findMenuItem(subName || args.item_name || "");
       if (!match) return res.json("ERROR: Stromboli not found. Available: Regular Cheese and Beef, Veggie, Philly Cheese Steak, Chicken.");
       
       var stBase = parseFloat(match.price_default || 0);
@@ -2057,7 +2057,9 @@ app.post("/retell/function/calculate_price", function (req, res) {
 
     // ── QUESADILLA (uses 12" pizza topping prices) ──
     if (itemType === "quesadilla") {
-      var match = findMenuItem(subName || args.item_name || "", "Quesadillas");
+      var match = findMenuItem(subName || args.item_name || "", "Quesadillas") 
+              || findMenuItem(subName || args.item_name || "", "Quesadilla")
+              || findMenuItem(subName || args.item_name || "");
       if (!match) return res.json("ERROR: Quesadilla not found. Available: Chicken Breast, Buffalo Chicken, Steak, Veggie, Shrimp.");
       
       var qBase = parseFloat(match.price_default || 0);
