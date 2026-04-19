@@ -1619,11 +1619,12 @@ app.post("/retell/function/calculate_price", function (req, res) {
     var args = req.body.args || req.body;
     var pricingId = "p" + Date.now() + Math.random().toString(36).substr(2,4);
     var origJson = res.json.bind(res);
-    res.json = function(data) { if (typeof data === "object" && data !== null && !Array.isArray(data)) data.pricing_id = pricingId; return origJson(data); };
+    res.json = function(data) { if (typeof data === "object" && data !== null && !Array.isArray(data)) { data.pricing_id = pricingId; data.quantity = orderQuantity; } return origJson(data); };
     var itemType = (args.item_type || "").toLowerCase().trim();
     var size = parseInt(args.size || 0);
     var toppings = args.toppings || [];
     var orderType = (args.order_type || "").toLowerCase().trim();
+    var orderQuantity = parseInt(args.order_quantity || 1) || 1;
     var subName = (args.sub_name || args.item_name || "").trim();
     var subSize = (args.sub_size || "half").toLowerCase();
     var fixins = args.fixins || [];
