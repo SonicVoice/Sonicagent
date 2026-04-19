@@ -1648,10 +1648,13 @@ app.post("/retell/function/calculate_price", function (req, res) {
       var pizzaPrices = {10:8.99, 12:10.99, 14:11.99, 16:13.99, 18:14.99};
       var sizeLabels = {10:"Sm",12:"Med",14:"Lrg",16:"XL",18:"XXL"};
       
-      // Check for specialty pizza
+      // Check for specialty pizza — auto-detect even if item_type is just "pizza"
       var pizzaName = (args.pizza_name || args.item_name || "").toLowerCase();
-      var isSpecialty = false;
-      if (pizzaName && itemType === "specialty pizza") {
+      var SPECIALTY_NAMES = ["deluxe","supreme","veggie","hawaiian","steak","philly cheese steak",
+        "new york style","ny style","chicken bacon ranch","buffalo chicken","bbq chicken",
+        "meal buster","meat lover","unique"];
+      var isSpecName = SPECIALTY_NAMES.some(function(s) { return pizzaName.indexOf(s) !== -1; });
+      if (pizzaName && (itemType === "specialty pizza" || isSpecName)) {
         var specMatch = findMenuItem(pizzaName);
         if (specMatch && specMatch.item_type === "specialty_pizza") {
           var specPrice = parseFloat(specMatch["price_" + size] || 0);
