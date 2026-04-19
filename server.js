@@ -2107,7 +2107,7 @@ app.post("/retell/function/calculate_combo", function (req, res) {
     var pricingId = "p" + Date.now() + Math.random().toString(36).substr(2,4);
     var origJson2 = res.json.bind(res);
     res.json = function(data) { if (typeof data === "object" && data !== null && !Array.isArray(data)) data.pricing_id = pricingId; return origJson2(data); };
-    var dealType = (args.deal_type || "").toLowerCase().trim();
+    var dealType = (args.deal_type || "").toLowerCase().trim().replace(/_/g, " ");
     var pizzaSize = parseInt(args.pizza_size || 0);
     var pizzas = args.pizzas || []; // [{toppings:[{name,half}]}]
     var subName = (args.sub_name || "").trim();
