@@ -435,8 +435,8 @@ var FIXED_ITEMS = {
   "garlic bread w/ cheese": 622, "garlic bread with cheese": 622,
   "garlic bread": 621,
   "cole slaw": 619, "coleslaw": 619,
-  "bag chips plain": 610, "chips plain": 610, "plain chips": 610,
-  "bag chips bbq": 810, "chips bbq": 810, "bbq chips": 810,
+  "bag chips plain": 610, "chips plain": 610, "plain chips": 610, "bag chips": 610, "chips": 610,
+  "bag chips bbq": 610, "chips bbq": 610, "bbq chips": 610, "barbecue chips": 610, "barbeque chips": 610,
   "nacho cheese cup": 848,
   "gravy cup": 849,
 
@@ -2080,6 +2080,37 @@ app.post("/retell/function/calculate_price", function (req, res) {
       });
     }
 
+    // ── CHIPS (flavor as modifier) ──
+    var itemNameLower = (args.item_name || "").toLowerCase();
+    if (itemNameLower.indexOf("chips") !== -1 || itemType === "chips") {
+      var chipFlavors = {
+        "bbq": {name: "BBQ", id: 810}, "barbecue": {name: "BBQ", id: 810}, "barbeque": {name: "BBQ", id: 810},
+        "plain": {name: "Plain", id: null}, "regular": {name: "Plain", id: null},
+        "sour cream": {name: "Sour Cream & Onion", id: null}, "salt and vinegar": {name: "Salt & Vinegar", id: null},
+        "pickle": {name: "Pickle", id: null}, "crab": {name: "Crab", id: null}
+      };
+      var chipFlavor = null;
+      for (var cf in chipFlavors) {
+        if (itemNameLower.indexOf(cf) !== -1) { chipFlavor = chipFlavors[cf]; break; }
+      }
+      if (!chipFlavor && specialInstructions) {
+        var siLower = specialInstructions.toLowerCase();
+        for (var cf2 in chipFlavors) {
+          if (siLower.indexOf(cf2) !== -1) { chipFlavor = chipFlavors[cf2]; break; }
+        }
+      }
+      var chipMods = [];
+      if (chipFlavor) chipMods.push({name: chipFlavor.name, modifier_id: chipFlavor.id, group: "Chip Flavor", price: 0});
+      return res.json({
+        item_name: "Bag Chips",
+        item_id: 610,
+        category: "Sides",
+        unit_price: 0.75,
+        modifiers: chipMods,
+        special_instructions: specialInstructions || undefined
+      });
+    }
+
     // ── GENERIC LOOKUP (sides, desserts, pasta, clubs, nuggets, seafood, platters) ──
     var match = findMenuItem(subName || args.item_name || itemType);
     if (match) {
@@ -2441,6 +2472,26 @@ app.get("/test-db", function (req, res) {
     },
     sample_sub: SUBS_DB.slice(0, 3).map(function(s) { return s.name + " [" + s.id + "] $" + s.p8; }),
     sample_deal: Object.keys(COMBO_DB).slice(0, 3)
+  });
+});
+
+app.get("/dump-menu", function (req, res) {
+  var table = (req.query.table || "items").toLowerCase();
+  var data = MENU_CACHE[table] || [];
+  res.json({ table: table, count: data.length, data: data });
+});
+
+app.get("/dump-all", function (req, res) {
+  res.json({
+    items: MENU_CACHE.items,
+    toppings: MENU_CACHE.toppings,
+    sub_fixins: MENU_CACHE.sub_fixins,
+    cheese_options: MENU_CACHE.cheese_options,
+    wing_flavors: MENU_CACHE.wing_flavors,
+    soda_flavors: MENU_CACHE.soda_flavors,
+    combo_deals: MENU_CACHE.combo_deals,
+    wrap_fixins: MENU_CACHE.wrap_fixins || [],
+    tender_sauces: MENU_CACHE.tender_sauces || []
   });
 });
 
