@@ -1086,7 +1086,7 @@ app.post("/retell/function/submit_order", async function (req, res) {
     log.status = result.ok ? "OK" : "FAIL";
     
     // Save to order history + cleanup active basket
-    var callId = (req.body.call || {}).call_id || "";
+    var callId = (req.body.call || {}).call_id || (req.body.call || {}).id || (req.body.call || {}).callId || "";
     if (callId) {
       await saveCustomerInfo(callId, data.customer_name, data.customer_phone, data.delivery_address);
       var tax = parseFloat(data.tax) || Math.round((parseFloat(data.subtotal) || 0) * 0.06 * 100) / 100;
@@ -1826,7 +1826,10 @@ function findMenuItem(input, filterCategory) {
 app.post("/retell/function/calculate_price", async function (req, res) {
   try {
     var args = req.body.args || req.body;
-    var callId = (req.body.call || {}).call_id || "";
+    var callObj = req.body.call || {};
+    var callId = callObj.call_id || callObj.id || callObj.callId || "";
+    console.log("\n=== BASKET DEBUG === callId:", callId, "call keys:", Object.keys(callObj).join(","));
+    console.log("=== FULL REQ BODY KEYS:", Object.keys(req.body).join(","));
     var pricingId = "p" + Date.now() + Math.random().toString(36).substr(2,4);
     var origJson = res.json.bind(res);
     res.json = async function(data) {
@@ -2365,7 +2368,9 @@ app.post("/retell/function/calculate_price", async function (req, res) {
 app.post("/retell/function/calculate_combo", async function (req, res) {
   try {
     var args = req.body.args || req.body;
-    var callId = (req.body.call || {}).call_id || "";
+    var callObj = req.body.call || {};
+    var callId = callObj.call_id || callObj.id || callObj.callId || "";
+    console.log("\n=== BASKET COMBO DEBUG === callId:", callId);
     var pricingId = "p" + Date.now() + Math.random().toString(36).substr(2,4);
     var origJson2 = res.json.bind(res);
     res.json = async function(data) {
@@ -2697,41 +2702,68 @@ app.post("/retell/function/calculate_combo", async function (req, res) {
 // ── GET BASKET — returns full basket for a call ──
 app.post("/retell/function/get_basket", async function (req, res) {
   try {
-    var callId = (req.body.call || {}).call_id || "";
+    var callId = (req.body.call || {}).call_id || (req.body.call || {}).id || (req.body.call || {}).callId || "";
     var basket = await getBasket(callId);
     var items = basket.items || [];
     
-    // Build readable summary
+    // Build readable summary for agent to speak
     var summary = [];
     for (var i = 0; i < items.length; i++) {
       var it = items[i];
-      var desc = it.item_name;
-      if (it.modifiers && it.modifiers.length > 0) {
-        var mods = it.modifiers.map(function(m) { return m.name; }).join(", ");
-        desc += " (" + mods + ")";
+      var desc = (i + 1) + ". " + it.item_name;
+      
+      if (it.is_combo && it.components && it.components.length > 0) {
+        // Combo — list components
+        var compDescs = [];
+        for (var c = 0; c < it.components.length; c++) {
+          var comp = it.components[c];
+          var compDesc = comp.component_name;
+          if (comp.modifiers && comp.modifiers.length > 0) {
+            compDesc += " with " + comp.modifiers.map(function(m) { return m.name; }).join(", ");
+          }
+          if (comp.special_instructions) compDesc += " (" + comp.special_instructions + ")";
+          compDescs.push(compDesc);
+        }
+        desc += " includes: " + compDescs.join(", ");
+      } else {
+        // Regular item — list modifiers
+        if (it.modifiers && it.modifiers.length > 0) {
+          desc += " with " + it.modifiers.map(function(m) { return m.name; }).join(", ");
+        }
       }
-      if (it.special_instructions) desc += " [" + it.special_instructions + "]";
-      desc += " $" + (parseFloat(it.unit_price) || 0).toFixed(2);
+      
+      if (it.special_instructions) desc += " (" + it.special_instructions + ")";
+      desc += " — $" + (parseFloat(it.unit_price) || 0).toFixed(2);
       summary.push(desc);
     }
     
+    var subtotal = parseFloat(basket.subtotal) || 0;
+    var tax = Math.round(subtotal * 0.06 * 100) / 100;
+    var total = Math.round((subtotal + tax) * 100) / 100;
+    var orderType = basket.order_type || "pickup";
+    if (orderType === "delivery") total += 3;
+    
+    // Also return as basket_json_summary for store field mapping
     res.json({
       item_count: items.length,
-      subtotal: basket.subtotal,
-      tax: Math.round(basket.subtotal * 0.06 * 100) / 100,
-      total: Math.round(basket.subtotal * 1.06 * 100) / 100,
+      subtotal: subtotal,
+      tax: tax,
+      total: total,
+      order_type: orderType,
+      delivery_fee: orderType === "delivery" ? 3 : 0,
       items: items,
-      summary: summary.join(" | ")
+      summary: summary.join(" | "),
+      basket_json_summary: JSON.stringify(items)
     });
   } catch (e) {
-    res.json({ error: e.message, items: [], subtotal: 0 });
+    res.json({ error: e.message, items: [], subtotal: 0, summary: "Error reading basket" });
   }
 });
 
 // ── REMOVE ITEM — remove item by index ──
 app.post("/retell/function/remove_item", async function (req, res) {
   try {
-    var callId = (req.body.call || {}).call_id || "";
+    var callId = (req.body.call || {}).call_id || (req.body.call || {}).id || (req.body.call || {}).callId || "";
     var args = req.body.args || req.body;
     var index = parseInt(args.item_index || 0);
     var result = await removeItemFromBasket(callId, index);
@@ -2784,7 +2816,7 @@ app.post("/retell/function/recall_order", async function (req, res) {
 // ── REORDER — copy a previous order into active basket ──
 app.post("/retell/function/reorder", async function (req, res) {
   try {
-    var callId = (req.body.call || {}).call_id || "";
+    var callId = (req.body.call || {}).call_id || (req.body.call || {}).id || (req.body.call || {}).callId || "";
     var args = req.body.args || req.body;
     var refNumber = (args.ref_number || "").trim();
     
