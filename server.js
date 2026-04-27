@@ -17,6 +17,9 @@ async function getOrCreateBasket(callId, orderType) {
   // Try DB first
   if (pool && DB_STATUS === "connected") {
     try {
+      // Clean stale baskets from abandoned calls (30 min timeout)
+      await pool.query("DELETE FROM active_baskets WHERE created_at < NOW() - INTERVAL '30 minutes'").catch(function(){});
+      
       var result = await pool.query(
         "SELECT * FROM active_baskets WHERE call_id = $1", [callId]
       );
