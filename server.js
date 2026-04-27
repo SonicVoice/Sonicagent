@@ -55,14 +55,19 @@ async function addItemToBasket(callId, item, isCombo) {
   var items = [];
   try { items = typeof basket.items === 'string' ? JSON.parse(basket.items) : (basket.items || []); } catch(e) { items = []; }
   
-  // If combo, remove component items that are now part of the deal
+  // If combo, remove ONLY the specific component items (one of each) that are now part of the deal
   if (isCombo && item.components) {
-    var compIds = item.components.map(function(c) { return String(c.item_id); });
-    var compCats = ["pizzas","submarines","wings","sides","beverages","sandwiches","chicken"];
-    items = items.filter(function(it) {
-      if (it.is_combo) return true;
-      return compCats.indexOf((it.category||"").toLowerCase()) === -1;
-    });
+    var compIdsToRemove = item.components.map(function(c) { return String(c.item_id); });
+    // Remove one matching item per component (not all items in that category)
+    for (var r = 0; r < compIdsToRemove.length; r++) {
+      var removeId = compIdsToRemove[r];
+      for (var j = 0; j < items.length; j++) {
+        if (!items[j].is_combo && String(items[j].item_id) === removeId) {
+          items.splice(j, 1);
+          break; // Only remove ONE matching item per component
+        }
+      }
+    }
   }
   
   // Build basket item
