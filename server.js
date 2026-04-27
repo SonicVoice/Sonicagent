@@ -5,6 +5,205 @@ app.use(express.json({ limit: "50mb" }));
 
 // ═══════════════════════════════════════════════════
 // DATABASE CONNECTION — loads menu into memory at startup
+// Every priced item auto-saves to Supabase
+// ═══════════════════════════════════════════════════
+
+// In-memory basket cache (fallback if DB unavailable)
+var BASKET_CACHE = {};
+
+async function getOrCreateBasket(callId, orderType) {
+  if (!callId) return null;
+  
+  // Try DB first
+  if (pool && DB_STATUS === "connected") {
+    try {
+      var result = await pool.query(
+        "SELECT * FROM active_baskets WHERE call_id = $1", [callId]
+      );
+      if (result.rows.length > 0) return result.rows[0];
+      
+      // Create new basket
+      var insert = await pool.query(
+        "INSERT INTO active_baskets (call_id, order_type, items, subtotal, item_count) VALUES ($1, $2, '[]'::jsonb, 0, 0) RETURNING *",
+        [callId, orderType || 'pickup']
+      );
+      return insert.rows[0];
+    } catch (e) {
+      console.error("Basket DB error:", e.message);
+    }
+  }
+  
+  // Fallback to memory
+  if (!BASKET_CACHE[callId]) {
+    BASKET_CACHE[callId] = {
+      call_id: callId, order_type: orderType || 'pickup',
+      items: [], subtotal: 0, item_count: 0
+    };
+  }
+  return BASKET_CACHE[callId];
+}
+
+async function addItemToBasket(callId, item, isCombo) {
+  if (!callId || !item) return null;
+  
+  var basket = await getOrCreateBasket(callId);
+  if (!basket) return null;
+  
+  var items = [];
+  try { items = typeof basket.items === 'string' ? JSON.parse(basket.items) : (basket.items || []); } catch(e) { items = []; }
+  
+  // If combo, remove component items that are now part of the deal
+  if (isCombo && item.components) {
+    var compIds = item.components.map(function(c) { return String(c.item_id); });
+    var compCats = ["pizzas","submarines","wings","sides","beverages","sandwiches","chicken"];
+    items = items.filter(function(it) {
+      if (it.is_combo) return true;
+      return compCats.indexOf((it.category||"").toLowerCase()) === -1;
+    });
+  }
+  
+  // Build basket item
+  var basketItem = {
+    item_name: item.item_name || item.deal_name || "Unknown",
+    item_id: String(item.item_id || item.deal_id || "0"),
+    unit_price: parseFloat(item.unit_price || 0),
+    category: isCombo ? "Combo" : (item.category || "Other"),
+    quantity: parseInt(item.quantity || 1),
+    is_combo: !!isCombo,
+    modifiers: item.modifiers || [],
+    special_instructions: item.special_instructions || null,
+    pricing_id: item.pricing_id || null
+  };
+  
+  if (isCombo) {
+    basketItem.deal_id = String(item.deal_id || item.item_id || "0");
+    basketItem.components = item.components || [];
+    basketItem.deal_name = item.deal_name || "";
+  }
+  
+  // Add quantity copies for non-combo
+  var qty = parseInt(item.quantity || 1);
+  if (!isCombo && qty > 1) {
+    for (var q = 0; q < qty; q++) {
+      var copy = JSON.parse(JSON.stringify(basketItem));
+      copy.quantity = 1;
+      items.push(copy);
+    }
+  } else {
+    items.push(basketItem);
+  }
+  
+  // Calculate subtotal
+  var subtotal = 0;
+  for (var i = 0; i < items.length; i++) {
+    subtotal += (parseFloat(items[i].unit_price) || 0) * (parseInt(items[i].quantity) || 1);
+  }
+  subtotal = Math.round(subtotal * 100) / 100;
+  
+  // Save to DB
+  if (pool && DB_STATUS === "connected") {
+    try {
+      await pool.query(
+        "UPDATE active_baskets SET items = $1::jsonb, subtotal = $2, item_count = $3, updated_at = NOW() WHERE call_id = $4",
+        [JSON.stringify(items), subtotal, items.length, callId]
+      );
+    } catch (e) {
+      console.error("Basket save error:", e.message);
+    }
+  }
+  
+  // Also update memory cache
+  BASKET_CACHE[callId] = { call_id: callId, items: items, subtotal: subtotal, item_count: items.length };
+  
+  return { items: items, subtotal: subtotal, item_count: items.length };
+}
+
+async function getBasket(callId) {
+  if (!callId) return { items: [], subtotal: 0, item_count: 0 };
+  
+  if (pool && DB_STATUS === "connected") {
+    try {
+      var result = await pool.query("SELECT * FROM active_baskets WHERE call_id = $1", [callId]);
+      if (result.rows.length > 0) {
+        var row = result.rows[0];
+        var items = typeof row.items === 'string' ? JSON.parse(row.items) : (row.items || []);
+        return { items: items, subtotal: parseFloat(row.subtotal) || 0, item_count: row.item_count || items.length, order_type: row.order_type };
+      }
+    } catch (e) {
+      console.error("Basket get error:", e.message);
+    }
+  }
+  
+  // Fallback to memory
+  var cached = BASKET_CACHE[callId];
+  if (cached) return { items: cached.items || [], subtotal: cached.subtotal || 0, item_count: cached.item_count || 0 };
+  return { items: [], subtotal: 0, item_count: 0 };
+}
+
+async function removeItemFromBasket(callId, itemIndex) {
+  var basket = await getBasket(callId);
+  var items = basket.items || [];
+  if (itemIndex >= 0 && itemIndex < items.length) {
+    items.splice(itemIndex, 1);
+    var subtotal = 0;
+    for (var i = 0; i < items.length; i++) {
+      subtotal += (parseFloat(items[i].unit_price) || 0) * (parseInt(items[i].quantity) || 1);
+    }
+    subtotal = Math.round(subtotal * 100) / 100;
+    
+    if (pool && DB_STATUS === "connected") {
+      try {
+        await pool.query(
+          "UPDATE active_baskets SET items = $1::jsonb, subtotal = $2, item_count = $3, updated_at = NOW() WHERE call_id = $4",
+          [JSON.stringify(items), subtotal, items.length, callId]
+        );
+      } catch(e) { console.error("Remove error:", e.message); }
+    }
+    BASKET_CACHE[callId] = { call_id: callId, items: items, subtotal: subtotal, item_count: items.length };
+    return { items: items, subtotal: subtotal, item_count: items.length, removed: true };
+  }
+  return { items: items, subtotal: basket.subtotal, item_count: items.length, removed: false };
+}
+
+async function saveCustomerInfo(callId, name, phone, address) {
+  if (pool && DB_STATUS === "connected") {
+    try {
+      var sets = [];
+      var vals = [];
+      var idx = 1;
+      if (name) { sets.push("customer_name = $" + idx); vals.push(name); idx++; }
+      if (phone) { sets.push("customer_phone = $" + idx); vals.push(phone); idx++; }
+      if (address) { sets.push("delivery_address = $" + idx); vals.push(address); idx++; }
+      if (sets.length > 0) {
+        vals.push(callId);
+        await pool.query("UPDATE active_baskets SET " + sets.join(", ") + ", updated_at = NOW() WHERE call_id = $" + idx, vals);
+      }
+    } catch(e) { console.error("Customer info save error:", e.message); }
+  }
+}
+
+async function completeOrder(callId, refNumber, paymentMethod, tax, total) {
+  var basket = await getBasket(callId);
+  if (pool && DB_STATUS === "connected") {
+    try {
+      // Get customer info
+      var bResult = await pool.query("SELECT * FROM active_baskets WHERE call_id = $1", [callId]);
+      var bRow = bResult.rows[0] || {};
+      
+      await pool.query(
+        "INSERT INTO order_history (call_id, ref_number, order_type, items, subtotal, tax, delivery_fee, total, customer_name, customer_phone, delivery_address, payment_method) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
+        [callId, refNumber, bRow.order_type || 'pickup', JSON.stringify(basket.items), basket.subtotal, tax, bRow.order_type === 'delivery' ? 3 : 0, total, bRow.customer_name, bRow.customer_phone, bRow.delivery_address, paymentMethod || 'cash']
+      );
+      
+      // Clean up active basket
+      await pool.query("DELETE FROM active_baskets WHERE call_id = $1", [callId]);
+    } catch(e) { console.error("Complete order error:", e.message); }
+  }
+  delete BASKET_CACHE[callId];
+  return { success: true, ref: refNumber };
+}
+
+console.log("Basket system: initialized");
 // Falls back to hardcoded data if database is unavailable
 // ═══════════════════════════════════════════════════
 var Pool = null;
@@ -885,6 +1084,16 @@ app.post("/retell/function/submit_order", async function (req, res) {
     var result = await sendToPOS(built.xml);
     log.pos = result;
     log.status = result.ok ? "OK" : "FAIL";
+    
+    // Save to order history + cleanup active basket
+    var callId = (req.body.call || {}).call_id || "";
+    if (callId) {
+      await saveCustomerInfo(callId, data.customer_name, data.customer_phone, data.delivery_address);
+      var tax = parseFloat(data.tax) || Math.round((parseFloat(data.subtotal) || 0) * 0.06 * 100) / 100;
+      var total = parseFloat(data.total) || 0;
+      await completeOrder(callId, String(built.ref), data.payment_method || "cash", tax, total);
+    }
+    
     res.json(result.ok ? "Order placed! Ref " + built.ref + ". " + result.response : "Order ref " + built.ref + ". POS: " + result.response);
   } catch (e) {
     log.status = "ERROR"; log.error = e.message;
@@ -1614,12 +1823,30 @@ function findMenuItem(input, filterCategory) {
 // ═══════════════════════════════════════════════════
 // TOOL 1: calculate_price — for ALL menu items
 // ═══════════════════════════════════════════════════
-app.post("/retell/function/calculate_price", function (req, res) {
+app.post("/retell/function/calculate_price", async function (req, res) {
   try {
     var args = req.body.args || req.body;
+    var callId = (req.body.call || {}).call_id || "";
     var pricingId = "p" + Date.now() + Math.random().toString(36).substr(2,4);
     var origJson = res.json.bind(res);
-    res.json = function(data) { if (typeof data === "object" && data !== null && !Array.isArray(data)) { data.pricing_id = pricingId; data.quantity = orderQuantity; } return origJson(data); };
+    res.json = async function(data) {
+      if (typeof data === "object" && data !== null && !Array.isArray(data)) {
+        data.pricing_id = pricingId;
+        data.quantity = orderQuantity;
+        // AUTO-SAVE to server-side basket
+        if (callId && data.item_name && !String(data.item_name).startsWith("ERROR")) {
+          try {
+            var basketResult = await addItemToBasket(callId, data, false);
+            if (basketResult) {
+              data.basket_count = basketResult.item_count;
+              data.basket_subtotal = basketResult.subtotal;
+              data.basket_json = JSON.stringify(basketResult.items);
+            }
+          } catch(be) { console.error("Basket auto-save error:", be.message); }
+        }
+      }
+      return origJson(data);
+    };
     var itemType = (args.item_type || "").toLowerCase().trim();
     var size = parseInt(args.size || 0);
     var toppings = args.toppings || [];
@@ -2135,12 +2362,29 @@ app.post("/retell/function/calculate_price", function (req, res) {
 // TOOL 2: calculate_combo — for combo deals
 // Handles all topping math, free topping rules, ID lookups
 // ═══════════════════════════════════════════════════
-app.post("/retell/function/calculate_combo", function (req, res) {
+app.post("/retell/function/calculate_combo", async function (req, res) {
   try {
     var args = req.body.args || req.body;
+    var callId = (req.body.call || {}).call_id || "";
     var pricingId = "p" + Date.now() + Math.random().toString(36).substr(2,4);
     var origJson2 = res.json.bind(res);
-    res.json = function(data) { if (typeof data === "object" && data !== null && !Array.isArray(data)) data.pricing_id = pricingId; return origJson2(data); };
+    res.json = async function(data) {
+      if (typeof data === "object" && data !== null && !Array.isArray(data)) {
+        data.pricing_id = pricingId;
+        // AUTO-SAVE combo to server-side basket
+        if (callId && data.deal_name && !String(data.deal_name || "").startsWith("ERROR")) {
+          try {
+            var basketResult = await addItemToBasket(callId, data, true);
+            if (basketResult) {
+              data.basket_count = basketResult.item_count;
+              data.basket_subtotal = basketResult.subtotal;
+              data.basket_json = JSON.stringify(basketResult.items);
+            }
+          } catch(be) { console.error("Basket combo-save error:", be.message); }
+        }
+      }
+      return origJson2(data);
+    };
     var dealType = (args.deal_type || "").toLowerCase().trim().replace(/_/g, " ");
     var pizzaSize = parseInt(args.pizza_size || 0);
     var pizzas = args.pizzas || []; // [{toppings:[{name,half}]}]
@@ -2449,6 +2693,140 @@ app.post("/retell/function/calculate_combo", function (req, res) {
 });
 
 // ═══ DATABASE MANAGEMENT ENDPOINTS ═══
+
+// ── GET BASKET — returns full basket for a call ──
+app.post("/retell/function/get_basket", async function (req, res) {
+  try {
+    var callId = (req.body.call || {}).call_id || "";
+    var basket = await getBasket(callId);
+    var items = basket.items || [];
+    
+    // Build readable summary
+    var summary = [];
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      var desc = it.item_name;
+      if (it.modifiers && it.modifiers.length > 0) {
+        var mods = it.modifiers.map(function(m) { return m.name; }).join(", ");
+        desc += " (" + mods + ")";
+      }
+      if (it.special_instructions) desc += " [" + it.special_instructions + "]";
+      desc += " $" + (parseFloat(it.unit_price) || 0).toFixed(2);
+      summary.push(desc);
+    }
+    
+    res.json({
+      item_count: items.length,
+      subtotal: basket.subtotal,
+      tax: Math.round(basket.subtotal * 0.06 * 100) / 100,
+      total: Math.round(basket.subtotal * 1.06 * 100) / 100,
+      items: items,
+      summary: summary.join(" | ")
+    });
+  } catch (e) {
+    res.json({ error: e.message, items: [], subtotal: 0 });
+  }
+});
+
+// ── REMOVE ITEM — remove item by index ──
+app.post("/retell/function/remove_item", async function (req, res) {
+  try {
+    var callId = (req.body.call || {}).call_id || "";
+    var args = req.body.args || req.body;
+    var index = parseInt(args.item_index || 0);
+    var result = await removeItemFromBasket(callId, index);
+    res.json(result);
+  } catch (e) {
+    res.json({ error: e.message });
+  }
+});
+
+// ── RECALL ORDER — search past orders by phone or address ──
+app.post("/retell/function/recall_order", async function (req, res) {
+  try {
+    var args = req.body.args || req.body;
+    var phone = (args.phone || "").replace(/\D/g, "");
+    var address = (args.address || "").trim();
+    
+    var results = [];
+    if (pool && DB_STATUS === "connected") {
+      var query, params;
+      if (phone) {
+        query = "SELECT * FROM order_history WHERE customer_phone LIKE $1 ORDER BY created_at DESC LIMIT 5";
+        params = ["%" + phone.slice(-7) + "%"];
+      } else if (address) {
+        query = "SELECT * FROM order_history WHERE delivery_address ILIKE $1 ORDER BY created_at DESC LIMIT 5";
+        params = ["%" + address + "%"];
+      } else {
+        return res.json({ error: "Provide phone or address to search." });
+      }
+      
+      var dbResult = await pool.query(query, params);
+      results = dbResult.rows.map(function(row) {
+        var items = typeof row.items === 'string' ? JSON.parse(row.items) : (row.items || []);
+        return {
+          ref_number: row.ref_number,
+          order_type: row.order_type,
+          items: items.map(function(it) { return it.item_name; }),
+          total: parseFloat(row.total),
+          customer_name: row.customer_name,
+          date: row.created_at
+        };
+      });
+    }
+    
+    res.json({ orders_found: results.length, orders: results });
+  } catch (e) {
+    res.json({ error: e.message, orders: [] });
+  }
+});
+
+// ── REORDER — copy a previous order into active basket ──
+app.post("/retell/function/reorder", async function (req, res) {
+  try {
+    var callId = (req.body.call || {}).call_id || "";
+    var args = req.body.args || req.body;
+    var refNumber = (args.ref_number || "").trim();
+    
+    if (!refNumber) return res.json({ error: "Need ref_number to reorder." });
+    
+    if (pool && DB_STATUS === "connected") {
+      var dbResult = await pool.query("SELECT * FROM order_history WHERE ref_number = $1", [refNumber]);
+      if (dbResult.rows.length === 0) return res.json({ error: "Order not found." });
+      
+      var oldOrder = dbResult.rows[0];
+      var oldItems = typeof oldOrder.items === 'string' ? JSON.parse(oldOrder.items) : (oldOrder.items || []);
+      
+      // Create basket with old items
+      await getOrCreateBasket(callId, oldOrder.order_type);
+      if (pool) {
+        await pool.query(
+          "UPDATE active_baskets SET items = $1::jsonb, subtotal = $2, item_count = $3, updated_at = NOW() WHERE call_id = $4",
+          [JSON.stringify(oldItems), parseFloat(oldOrder.subtotal), oldItems.length, callId]
+        );
+      }
+      
+      res.json({
+        reordered: true,
+        ref_number: refNumber,
+        items: oldItems.map(function(it) { return it.item_name; }),
+        subtotal: parseFloat(oldOrder.subtotal),
+        item_count: oldItems.length
+      });
+    } else {
+      res.json({ error: "Database not available for reorder." });
+    }
+  } catch (e) {
+    res.json({ error: e.message });
+  }
+});
+
+// ── VIEW BASKET (GET) — debug endpoint ──
+app.get("/basket/:callId", async function (req, res) {
+  var basket = await getBasket(req.params.callId);
+  res.json(basket);
+});
+
 app.get("/reload-menu", async function (req, res) {
   var ok = await loadMenuFromDB();
   res.json({ reloaded: ok, status: DB_STATUS, loaded_from: MENU_CACHE.loaded_from, loaded_at: MENU_CACHE.loaded_at,
