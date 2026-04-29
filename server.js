@@ -23,7 +23,19 @@ async function getOrCreateBasket(callId, orderType) {
       var result = await pool.query(
         "SELECT * FROM active_baskets WHERE call_id = $1", [callId]
       );
-      if (result.rows.length > 0) return result.rows[0];
+      if (result.rows.length > 0) {
+        var row = result.rows[0];
+        // If basket is older than 10 minutes, it's stale — reset it (handles test simulator reuse)
+        var ageMs = Date.now() - new Date(row.updated_at || row.created_at).getTime();
+        if (ageMs > 10 * 60 * 1000) {
+          console.log("Basket stale (" + Math.round(ageMs/60000) + " min old), resetting for call " + callId);
+          await pool.query("UPDATE active_baskets SET items = '[]'::jsonb, subtotal = 0, item_count = 0, order_type = $1, created_at = NOW(), updated_at = NOW() WHERE call_id = $2", [orderType || 'pickup', callId]);
+          row.items = [];
+          row.subtotal = 0;
+          row.item_count = 0;
+        }
+        return row;
+      }
       
       // Create new basket
       var insert = await pool.query(
@@ -2776,6 +2788,61 @@ app.post("/retell/function/remove_item", async function (req, res) {
     var index = parseInt(args.item_index || 0);
     var result = await removeItemFromBasket(callId, index);
     res.json(result);
+  } catch (e) {
+    res.json({ error: e.message });
+  }
+});
+
+// ── LOOKUP PRICE — get price WITHOUT adding to basket ──
+// Forwards to calculate_price logic but does NOT save to basket
+app.post("/retell/function/lookup_price", async function (req, res) {
+  try {
+    // Reroute to calculate_price but suppress basket save
+    req.body._lookup_only = true;
+    
+    // We need to bypass the basket auto-save in calculate_price
+    // Easiest way: call the same internal logic, but skip basket
+    var args = req.body.args || req.body;
+    
+    // Build a sub-request to calculate_price WITHOUT call_id (so basket save is skipped)
+    var fakeReq = {
+      body: {
+        args: args,
+        call: {} // empty call object → no callId → no basket save
+      }
+    };
+    
+    // Use a response interceptor
+    var done = false;
+    var fakeRes = {
+      json: function(data) {
+        done = true;
+        // Strip basket fields if any leaked
+        if (typeof data === "object" && data !== null) {
+          delete data.basket_count;
+          delete data.basket_subtotal;
+          delete data.basket_json;
+        }
+        res.json(data);
+      }
+    };
+    
+    // Forward to calculate_price handler internally
+    // Find the calculate_price route handler and call it
+    var pricingHandler = null;
+    for (var i = 0; i < app._router.stack.length; i++) {
+      var layer = app._router.stack[i];
+      if (layer.route && layer.route.path === "/retell/function/calculate_price") {
+        pricingHandler = layer.route.stack[0].handle;
+        break;
+      }
+    }
+    
+    if (pricingHandler) {
+      await pricingHandler(fakeReq, fakeRes);
+    } else {
+      res.json({ error: "Pricing handler not found" });
+    }
   } catch (e) {
     res.json({ error: e.message });
   }
